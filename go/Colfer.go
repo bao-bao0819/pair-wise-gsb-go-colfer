@@ -44,6 +44,116 @@ func (i ColferTail) Error() string {
 	return fmt.Sprintf("colfer: data continuation at byte %d", i)
 }
 
+// ColferBudgetError signals a decode budget breach.
+type ColferBudgetError struct {
+	// Kind names the exhausted budget: "depth", "list" or "bytes".
+	Kind string
+	// Field is the schema field path where the budget ran out.
+	Field string
+	// Limit is the configured budget maximum.
+	Limit int
+}
+
+// Error honors the error interface.
+func (e ColferBudgetError) Error() string {
+	return fmt.Sprintf("colfer: %s budget of %d exceeded at %s", e.Kind, e.Limit, e.Field)
+}
+
+// UnmarshalOptions are decode limits for UnmarshalWithOptions.
+// The zero value disables all limits, which is compatible with
+// Unmarshal.
+type UnmarshalOptions struct {
+	// DepthMax is the upper limit for the number of nested data
+	// structure levels below the root object. Zero means no limit.
+	DepthMax int
+	// ListTotalMax is the upper limit for the cumulative number of
+	// list elements in the message. Zero means no limit.
+	ListTotalMax int
+	// VarBytesMax is the upper limit for the cumulative number of
+	// variable-length data bytes, i.e. text and binary content, in
+	// the message. Zero means no limit.
+	VarBytesMax int
+}
+
+// budget returns the decode state, or nil when no limits apply.
+func (opts *UnmarshalOptions) budget() *ColferBudget {
+	if opts == nil || (opts.DepthMax <= 0 && opts.ListTotalMax <= 0 && opts.VarBytesMax <= 0) {
+		return nil
+	}
+	return &ColferBudget{
+		DepthMax:  opts.DepthMax,
+		DepthLeft: opts.DepthMax,
+		ListMax:   opts.ListTotalMax,
+		ListLeft:  opts.ListTotalMax,
+		BytesMax:  opts.VarBytesMax,
+		BytesLeft: opts.VarBytesMax,
+	}
+}
+
+// ColferBudget tracks the remaining decode allowances of a message.
+// List and bytes spends are cumulative and are never refunded, not
+// even when a field fails to decode. A maximum at or below zero
+// disables its respective limit.
+type ColferBudget struct {
+	DepthMax, DepthLeft int
+	ListMax, ListLeft   int
+	BytesMax, BytesLeft int
+}
+
+// enter spends one nesting level on field.
+func (b *ColferBudget) enter(field string) error {
+	if b == nil || b.DepthMax <= 0 {
+		return nil
+	}
+	if b.DepthLeft <= 0 {
+		return ColferBudgetError{Kind: "depth", Field: field, Limit: b.DepthMax}
+	}
+	b.DepthLeft--
+	return nil
+}
+
+// leave releases one nesting level.
+func (b *ColferBudget) leave() {
+	if b == nil || b.DepthMax <= 0 {
+		return
+	}
+	b.DepthLeft++
+}
+
+// list charges n elements to field.
+func (b *ColferBudget) list(field string, n uint) error {
+	if b == nil || b.ListMax <= 0 {
+		return nil
+	}
+	if uint64(n) > uint64(b.ListLeft) {
+		return ColferBudgetError{Kind: "list", Field: field, Limit: b.ListMax}
+	}
+	b.ListLeft -= int(n)
+	return nil
+}
+
+// bytes charges n variable-length data bytes to field.
+func (b *ColferBudget) bytes(field string, n uint) error {
+	if b == nil || b.BytesMax <= 0 {
+		return nil
+	}
+	if uint64(n) > uint64(b.BytesLeft) {
+		return ColferBudgetError{Kind: "bytes", Field: field, Limit: b.BytesMax}
+	}
+	b.BytesLeft -= int(n)
+	return nil
+}
+
+// prependFieldPath returns err with the field path extended when, and
+// only when, err is a ColferBudgetError.
+func prependFieldPath(field string, err error) error {
+	if berr, ok := err.(ColferBudgetError); ok {
+		berr.Field = field + "/" + berr.Field
+		return berr
+	}
+	return err
+}
+
 // O contains all supported data types.
 type O struct {
 	// B tests booleans.
@@ -556,6 +666,32 @@ func (o *O) MarshalBinary() (data []byte, err error) {
 // Unmarshal decodes data as Colfer and returns the number of bytes read.
 // The error return options are io.EOF, ColferError and ColferMax.
 func (o *O) Unmarshal(data []byte) (int, error) {
+	return o.UnmarshalBudget(data, nil)
+}
+
+// UnmarshalWithOptions decodes data as Colfer like Unmarshal, with the
+// budgets from opts applied to the message as a whole, including all
+// nested structures. A nil opts applies no budgets, like Unmarshal.
+// The target o is left untouched when an error occurs.
+// The error return options are io.EOF, ColferError, ColferMax and
+// ColferBudgetError.
+func (o *O) UnmarshalWithOptions(data []byte, opts *UnmarshalOptions) (int, error) {
+	var v O
+	n, err := v.UnmarshalBudget(data, opts.budget())
+	if err != nil {
+		return 0, err
+	}
+	*o = v
+	return n, nil
+}
+
+// UnmarshalBudget decodes data as Colfer like Unmarshal, charging the
+// budget b for nested structures, list elements and variable-length
+// data. A nil b applies no budgets, like Unmarshal. Unlike
+// UnmarshalWithOptions, the decode writes directly into o.
+// The error return options are io.EOF, ColferError, ColferMax and
+// ColferBudgetError.
+func (o *O) UnmarshalBudget(data []byte, b *ColferBudget) (int, error) {
 	if len(data) == 0 {
 		return 0, io.EOF
 	}
@@ -834,6 +970,9 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 		if x > uint(ColferSizeMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: gen.o.s size %d exceeds %d bytes", x, ColferSizeMax))
 		}
+		if err := b.bytes("gen.o.s", x); err != nil {
+			return 0, err
+		}
 
 		start := i
 		i += int(x)
@@ -873,6 +1012,9 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 		if x > uint(ColferSizeMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: gen.o.a size %d exceeds %d bytes", x, ColferSizeMax))
 		}
+		if err := b.bytes("gen.o.a", x); err != nil {
+			return 0, err
+		}
 		v := make([]byte, int(x))
 
 		start := i
@@ -888,14 +1030,19 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 	}
 
 	if header == 10 {
-		o.O = new(O)
-		n, err := o.O.Unmarshal(data[i:])
+		if err := b.enter("gen.o.o"); err != nil {
+			return 0, err
+		}
+		v := new(O)
+		n, err := v.UnmarshalBudget(data[i:], b)
 		if err != nil {
 			if err == io.EOF && len(data) >= ColferSizeMax {
 				return 0, ColferMax(fmt.Sprintf("colfer: gen.o size exceeds %d bytes", ColferSizeMax))
 			}
-			return 0, err
+			return 0, prependFieldPath("gen.o.o", err)
 		}
+		b.leave()
+		o.O = v
 		i += n
 
 		if i >= len(data) {
@@ -932,6 +1079,12 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 		if x > uint(ColferListMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: gen.o.os length %d exceeds %d elements", x, ColferListMax))
 		}
+		if err := b.list("gen.o.os", x); err != nil {
+			return 0, err
+		}
+		if err := b.enter("gen.o.os"); err != nil {
+			return 0, err
+		}
 
 		l := int(x)
 		a := make([]*O, l)
@@ -940,15 +1093,16 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 			v := &malloc[ai]
 			a[ai] = v
 
-			n, err := v.Unmarshal(data[i:])
+			n, err := v.UnmarshalBudget(data[i:], b)
 			if err != nil {
 				if err == io.EOF && len(data) >= ColferSizeMax {
 					return 0, ColferMax(fmt.Sprintf("colfer: gen.o size exceeds %d bytes", ColferSizeMax))
 				}
-				return 0, err
+				return 0, prependFieldPath("gen.o.os", err)
 			}
 			i += n
 		}
+		b.leave()
 		o.Os = a
 
 		if i >= len(data) {
@@ -985,6 +1139,9 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 		if x > uint(ColferListMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: gen.o.ss length %d exceeds %d elements", x, ColferListMax))
 		}
+		if err := b.list("gen.o.ss", x); err != nil {
+			return 0, err
+		}
 		a := make([]string, int(x))
 		o.Ss = a
 
@@ -1014,6 +1171,9 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 
 			if x > uint(ColferSizeMax) {
 				return 0, ColferMax(fmt.Sprintf("colfer: gen.o.ss element %d size %d exceeds %d bytes", ai, x, ColferSizeMax))
+			}
+			if err := b.bytes("gen.o.ss", x); err != nil {
+				return 0, err
 			}
 
 			start := i
@@ -1058,6 +1218,9 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 		if x > uint(ColferListMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: gen.o.as length %d exceeds %d elements", x, ColferListMax))
 		}
+		if err := b.list("gen.o.as", x); err != nil {
+			return 0, err
+		}
 		a := make([][]byte, int(x))
 		o.As = a
 		for ai := range a {
@@ -1086,6 +1249,9 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 
 			if x > uint(ColferSizeMax) {
 				return 0, ColferMax(fmt.Sprintf("colfer: gen.o.as element %d size %d exceeds %d bytes", ai, x, ColferSizeMax))
+			}
+			if err := b.bytes("gen.o.as", x); err != nil {
+				return 0, err
 			}
 			v := make([]byte, int(x))
 
@@ -1164,6 +1330,9 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 		if x > uint(ColferListMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: gen.o.f32s length %d exceeds %d elements", x, ColferListMax))
 		}
+		if err := b.list("gen.o.f32s", x); err != nil {
+			return 0, err
+		}
 
 		l := int(x)
 
@@ -1208,6 +1377,9 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 
 		if x > uint(ColferListMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: gen.o.f64s length %d exceeds %d elements", x, ColferListMax))
+		}
+		if err := b.list("gen.o.f64s", x); err != nil {
+			return 0, err
 		}
 		l := int(x)
 
@@ -1313,6 +1485,32 @@ func (o *DromedaryCase) MarshalBinary() (data []byte, err error) {
 // Unmarshal decodes data as Colfer and returns the number of bytes read.
 // The error return options are io.EOF, ColferError and ColferMax.
 func (o *DromedaryCase) Unmarshal(data []byte) (int, error) {
+	return o.UnmarshalBudget(data, nil)
+}
+
+// UnmarshalWithOptions decodes data as Colfer like Unmarshal, with the
+// budgets from opts applied to the message as a whole, including all
+// nested structures. A nil opts applies no budgets, like Unmarshal.
+// The target o is left untouched when an error occurs.
+// The error return options are io.EOF, ColferError, ColferMax and
+// ColferBudgetError.
+func (o *DromedaryCase) UnmarshalWithOptions(data []byte, opts *UnmarshalOptions) (int, error) {
+	var v DromedaryCase
+	n, err := v.UnmarshalBudget(data, opts.budget())
+	if err != nil {
+		return 0, err
+	}
+	*o = v
+	return n, nil
+}
+
+// UnmarshalBudget decodes data as Colfer like Unmarshal, charging the
+// budget b for nested structures, list elements and variable-length
+// data. A nil b applies no budgets, like Unmarshal. Unlike
+// UnmarshalWithOptions, the decode writes directly into o.
+// The error return options are io.EOF, ColferError, ColferMax and
+// ColferBudgetError.
+func (o *DromedaryCase) UnmarshalBudget(data []byte, b *ColferBudget) (int, error) {
 	if len(data) == 0 {
 		return 0, io.EOF
 	}
@@ -1345,6 +1543,9 @@ func (o *DromedaryCase) Unmarshal(data []byte) (int, error) {
 
 		if x > uint(ColferSizeMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: gen.dromedaryCase.PascalCase size %d exceeds %d bytes", x, ColferSizeMax))
+		}
+		if err := b.bytes("gen.dromedaryCase.PascalCase", x); err != nil {
+			return 0, err
 		}
 
 		start := i
@@ -1437,6 +1638,32 @@ func (o *EmbedO) MarshalBinary() (data []byte, err error) {
 // Unmarshal decodes data as Colfer and returns the number of bytes read.
 // The error return options are io.EOF, ColferError and ColferMax.
 func (o *EmbedO) Unmarshal(data []byte) (int, error) {
+	return o.UnmarshalBudget(data, nil)
+}
+
+// UnmarshalWithOptions decodes data as Colfer like Unmarshal, with the
+// budgets from opts applied to the message as a whole, including all
+// nested structures. A nil opts applies no budgets, like Unmarshal.
+// The target o is left untouched when an error occurs.
+// The error return options are io.EOF, ColferError, ColferMax and
+// ColferBudgetError.
+func (o *EmbedO) UnmarshalWithOptions(data []byte, opts *UnmarshalOptions) (int, error) {
+	var v EmbedO
+	n, err := v.UnmarshalBudget(data, opts.budget())
+	if err != nil {
+		return 0, err
+	}
+	*o = v
+	return n, nil
+}
+
+// UnmarshalBudget decodes data as Colfer like Unmarshal, charging the
+// budget b for nested structures, list elements and variable-length
+// data. A nil b applies no budgets, like Unmarshal. Unlike
+// UnmarshalWithOptions, the decode writes directly into o.
+// The error return options are io.EOF, ColferError, ColferMax and
+// ColferBudgetError.
+func (o *EmbedO) UnmarshalBudget(data []byte, b *ColferBudget) (int, error) {
 	if len(data) == 0 {
 		return 0, io.EOF
 	}
@@ -1444,14 +1671,19 @@ func (o *EmbedO) Unmarshal(data []byte) (int, error) {
 	i := 1
 
 	if header == 0 {
-		o.Inner = new(O)
-		n, err := o.Inner.Unmarshal(data[i:])
+		if err := b.enter("gen.EmbedO.inner"); err != nil {
+			return 0, err
+		}
+		v := new(O)
+		n, err := v.UnmarshalBudget(data[i:], b)
 		if err != nil {
 			if err == io.EOF && len(data) >= ColferSizeMax {
 				return 0, ColferMax(fmt.Sprintf("colfer: gen.EmbedO size exceeds %d bytes", ColferSizeMax))
 			}
-			return 0, err
+			return 0, prependFieldPath("gen.EmbedO.inner", err)
 		}
+		b.leave()
+		o.Inner = v
 		i += n
 
 		if i >= len(data) {

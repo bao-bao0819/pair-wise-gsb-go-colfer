@@ -229,6 +229,14 @@ Colfer is suited for untrusted data sources such as network I/O or bulk streams.
 Marshalling and unmarshalling comes with built-in size protection to ensure
 predictable memory consumption. The format prevents memory bombs by design.
 
+The Go unmarshaler can also bound the total cost of a message with
+`UnmarshalWithOptions`: the nesting depth, the cumulative number of list
+elements and the cumulative number of variable-length data bytes are charged
+against one budget per decode, across all fields and nested structures.
+Declared lengths are checked against the budget before any allocation happens,
+and a breach is reported as a `ColferBudgetError` with the budget kind and the
+schema field path.
+
 The marshaller may not produce malformed output, regardless of the data input.
 In no event may the unmarshaller read outside the boundaries of a serial. Fuzz
 testing did not reveal any volnurabilities yet. Computing power is welcome.

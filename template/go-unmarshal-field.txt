@@ -123,6 +123,9 @@
 		if x > uint(ColferListMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: {{.String}} length %d exceeds %d elements", x, ColferListMax))
 		}
+		if err := b.list("{{.String}}", x); err != nil {
+			return 0, err
+		}
 
 		l := int(x)
 		a := make([]int32, l)
@@ -224,6 +227,9 @@
 	{{template "unmarshal-varint" .}}
 		if x > uint(ColferListMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: {{.String}} length %d exceeds %d elements", x, ColferListMax))
+		}
+		if err := b.list("{{.String}}", x); err != nil {
+			return 0, err
 		}
 
 		l := int(x)
@@ -327,6 +333,9 @@
 		if x > uint(ColferListMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: {{.String}} length %d exceeds %d elements", x, ColferListMax))
 		}
+		if err := b.list("{{.String}}", x); err != nil {
+			return 0, err
+		}
 
 		l := int(x)
 
@@ -362,6 +371,9 @@
 {{template "unmarshal-varint" .}}
 		if x > uint(ColferListMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: {{.String}} length %d exceeds %d elements", x, ColferListMax))
+		}
+		if err := b.list("{{.String}}", x); err != nil {
+			return 0, err
 		}
 		l := int(x)
 
@@ -414,9 +426,12 @@
 {{else if eq .Type "text"}}
 	if header == {{.Index}} {
 {{template "unmarshal-varint" .}}
- {{- if .TypeList}}
+{{- if .TypeList}}
 		if x > uint(ColferListMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: {{.String}} length %d exceeds %d elements", x, ColferListMax))
+		}
+		if err := b.list("{{.String}}", x); err != nil {
+			return 0, err
 		}
 		a := make([]string, int(x))
 		o.{{.NameNative}} = a
@@ -425,6 +440,9 @@
 {{template "unmarshal-varint" .}}
 			if x > uint(ColferSizeMax) {
 				return 0, ColferMax(fmt.Sprintf("colfer: {{.String}} element %d size %d exceeds %d bytes", ai, x, ColferSizeMax))
+			}
+			if err := b.bytes("{{.String}}", x); err != nil {
+				return 0, err
 			}
 
 			start := i
@@ -441,9 +459,12 @@
 		header = data[i]
 		i++
 	}
- {{- else}}
+{{- else}}
 		if x > uint(ColferSizeMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: {{.String}} size %d exceeds %d bytes", x, ColferSizeMax))
+		}
+		if err := b.bytes("{{.String}}", x); err != nil {
+			return 0, err
 		}
 
 		start := i
@@ -460,9 +481,12 @@
 {{else if eq .Type "binary"}}
 	if header == {{.Index}} {
 {{template "unmarshal-varint" .}}
- {{- if not .TypeList}}
+{{- if not .TypeList}}
 		if x > uint(ColferSizeMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: {{.String}} size %d exceeds %d bytes", x, ColferSizeMax))
+		}
+		if err := b.bytes("{{.String}}", x); err != nil {
+			return 0, err
 		}
 		v := make([]byte, int(x))
 
@@ -476,9 +500,12 @@
 
 		header = data[i]
 		i++
- {{- else}}
+{{- else}}
 		if x > uint(ColferListMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: {{.String}} length %d exceeds %d elements", x, ColferListMax))
+		}
+		if err := b.list("{{.String}}", x); err != nil {
+			return 0, err
 		}
 		a := make([][]byte, int(x))
 		o.{{.NameNative}} = a
@@ -486,6 +513,9 @@
 {{template "unmarshal-varint" .}}
 			if x > uint(ColferSizeMax) {
 				return 0, ColferMax(fmt.Sprintf("colfer: {{.String}} element %d size %d exceeds %d bytes", ai, x, ColferSizeMax))
+			}
+			if err := b.bytes("{{.String}}", x); err != nil {
+				return 0, err
 			}
 			v := make([]byte, int(x))
 
@@ -512,15 +542,44 @@
 		if x > uint(ColferListMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: {{.String}} length %d exceeds %d elements", x, ColferListMax))
 		}
+		if err := b.list("{{.String}}", x); err != nil {
+			return 0, err
+		}
+		if err := b.enter("{{.String}}"); err != nil {
+			return 0, err
+		}
 
 		l := int(x)
 		a := make([]*{{.TypeNative}}, l)
 		malloc := make([]{{.TypeNative}}, l)
+{{- if eq .TypeRef.Pkg.Name .Struct.Pkg.Name}}
 		for ai := range a {
 			v := &malloc[ai]
 			a[ai] = v
 
-			n, err := v.Unmarshal(data[i:])
+			n, err := v.UnmarshalBudget(data[i:], b)
+			if err != nil {
+				if err == io.EOF && len(data) >= ColferSizeMax {
+					return 0, ColferMax(fmt.Sprintf("colfer: {{.Struct.String}} size exceeds %d bytes", ColferSizeMax))
+				}
+				return 0, prependFieldPath("{{.String}}", err)
+			}
+			i += n
+		}
+{{- else}}
+		var sub *{{.TypeRef.Pkg.NameNative}}.ColferBudget
+		if b != nil {
+			sub = &{{.TypeRef.Pkg.NameNative}}.ColferBudget{
+				DepthMax: b.DepthMax, DepthLeft: b.DepthLeft,
+				ListMax: b.ListMax, ListLeft: b.ListLeft,
+				BytesMax: b.BytesMax, BytesLeft: b.BytesLeft,
+			}
+		}
+		for ai := range a {
+			v := &malloc[ai]
+			a[ai] = v
+
+			n, err := v.UnmarshalBudget(data[i:], sub)
 			if err != nil {
 				if err == io.EOF && len(data) >= ColferSizeMax {
 					return 0, ColferMax(fmt.Sprintf("colfer: {{.Struct.String}} size exceeds %d bytes", ColferSizeMax))
@@ -529,6 +588,11 @@
 			}
 			i += n
 		}
+		if b != nil {
+			b.ListLeft, b.BytesLeft = sub.ListLeft, sub.BytesLeft
+		}
+{{- end}}
+		b.leave()
 		o.{{.NameNative}} = a
 
 		if i >= len(data) {
@@ -539,14 +603,36 @@
 	}
 {{else}}
 	if header == {{.Index}} {
-		o.{{.NameNative}} = new({{.TypeNative}})
-		n, err := o.{{.NameNative}}.Unmarshal(data[i:])
+		if err := b.enter("{{.String}}"); err != nil {
+			return 0, err
+		}
+		v := new({{.TypeNative}})
+{{- if eq .TypeRef.Pkg.Name .Struct.Pkg.Name}}
+		n, err := v.UnmarshalBudget(data[i:], b)
+{{- else}}
+		var sub *{{.TypeRef.Pkg.NameNative}}.ColferBudget
+		if b != nil {
+			sub = &{{.TypeRef.Pkg.NameNative}}.ColferBudget{
+				DepthMax: b.DepthMax, DepthLeft: b.DepthLeft,
+				ListMax: b.ListMax, ListLeft: b.ListLeft,
+				BytesMax: b.BytesMax, BytesLeft: b.BytesLeft,
+			}
+		}
+		n, err := v.UnmarshalBudget(data[i:], sub)
+{{- end}}
 		if err != nil {
 			if err == io.EOF && len(data) >= ColferSizeMax {
 				return 0, ColferMax(fmt.Sprintf("colfer: {{.Struct.String}} size exceeds %d bytes", ColferSizeMax))
 			}
-			return 0, err
+			return 0, prependFieldPath("{{.String}}", err)
 		}
+{{- if ne .TypeRef.Pkg.Name .Struct.Pkg.Name}}
+		if b != nil {
+			b.ListLeft, b.BytesLeft = sub.ListLeft, sub.BytesLeft
+		}
+{{- end}}
+		b.leave()
+		o.{{.NameNative}} = v
 		i += n
 
 		if i >= len(data) {
