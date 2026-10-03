@@ -233,6 +233,23 @@ The marshaller may not produce malformed output, regardless of the data input.
 In no event may the unmarshaller read outside the boundaries of a serial. Fuzz
 testing did not reveal any volnurabilities yet. Computing power is welcome.
 
+The Go decoder additionally offers per-message resource limits through
+`UnmarshalLimited`/`UnmarshalBinaryLimited` with a `ColferDecodeLimits` value:
+
+* `MaxDepth` bounds the nesting of struct fields, counted from the root at
+  level zero. A message whose deepest level equals the limit is accepted.
+* `MaxListElements` is a single cumulative budget for the number of list
+  elements across every field and every nested object in the message.
+* `MaxVarBytes` is a single cumulative budget for the number of bytes allocated
+  for text and binary values across the whole message.
+
+A zero value disables a budget, preserving the `ColferSizeMax` and
+`ColferListMax` defaults only. Declared lengths are checked for overflow and
+against the budget before any memory is allocated. Consumed budget is never
+restored after a backtrack or a field failure, and the target object is rolled
+back to its previous state when decoding fails. Breaches report a
+`*ColferLimitError` naming both the budget kind and the schema field path.
+
 
 ## Compatibility
 

@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"strings"
 )
 
 var intconv = binary.BigEndian
@@ -37,6 +38,201 @@ type ColferTail int
 // Error honors the error interface.
 func (i ColferTail) Error() string {
 	return fmt.Sprintf("colfer: data continuation at byte %d", i)
+}
+
+// ColferDecodeLimits caps the cumulative resources that a single Unmarshal
+// invocation is allowed to consume. Every field in a message, including all
+// nested fields, draws from the same budget.
+//
+// A zero value disables the respective limit, i.e. decoding falls back to the
+// global ColferSizeMax and ColferListMax defaults only. MaxDepth counts struct
+// nesting from the root object at level 0: a value of 1 allows exactly one
+// nested level and rejects the next, so a message whose deepest level equals
+// MaxDepth is accepted. The zero value leaves nesting unrestricted. Use
+// UnmarshalLimited to apply limits.
+type ColferDecodeLimits struct {
+	// MaxDepth is the maximum number of nested struct levels. Zero disables.
+	MaxDepth int
+	// MaxListElements is the cumulative list element budget. Zero disables.
+	MaxListElements uint64
+	// MaxVarBytes is the cumulative byte budget for variable-length data
+	// (text and binary values), counted across all fields and nesting. Zero
+	// disables.
+	MaxVarBytes uint64
+}
+
+// ColferLimitKind identifies a resource budget.
+type ColferLimitKind int
+
+// Resource budget identifiers.
+const (
+	// ColferLimitDepth reports a nesting level beyond MaxDepth.
+	ColferLimitDepth ColferLimitKind = 1 + iota
+	// ColferLimitListElements reports a cumulative list element overrun.
+	ColferLimitListElements
+	// ColferLimitVarBytes reports a cumulative variable-length byte overrun.
+	ColferLimitVarBytes
+	// ColferLimitLengthOverflow reports a declared length that cannot be
+	// addressed by the runtime, i.e. a malicious length prefix.
+	ColferLimitLengthOverflow
+)
+
+// String returns a short identifier used in error messages.
+func (k ColferLimitKind) String() string {
+	switch k {
+	case ColferLimitDepth:
+		return "max nesting depth"
+	case ColferLimitListElements:
+		return "max list elements"
+	case ColferLimitVarBytes:
+		return "max variable-length bytes"
+	case ColferLimitLengthOverflow:
+		return "declared length overflow"
+	default:
+		return "unknown limit"
+	}
+}
+
+// ColferLimitError signals that decoding exceeded a ColferDecodeLimits budget
+// or encountered a declared length that overflows the address space.
+type ColferLimitError struct {
+	// Kind names the breached budget.
+	Kind ColferLimitKind
+	// Field is the schema path of the field that triggered the breach, using
+	// dotted notation with list indices, e.g. "gen.o.os[3].ss".
+	Field string
+	// Limit is the configured budget value.
+	Limit uint64
+	// Used is the cumulative consumption at the moment of breach.
+	Used uint64
+	// Declared is the length read from the serial, when applicable.
+	Declared uint64
+}
+
+// Error honors the error interface.
+func (e *ColferLimitError) Error() string {
+	switch e.Kind {
+	case ColferLimitDepth:
+		return fmt.Sprintf("colfer: field %s nesting depth exceeds %d", e.Field, e.Limit)
+	case ColferLimitListElements:
+		return fmt.Sprintf("colfer: field %s list elements %d exceed cumulative budget %d (used %d)", e.Field, e.Declared, e.Limit, e.Used)
+	case ColferLimitVarBytes:
+		return fmt.Sprintf("colfer: field %s variable length %d exceeds cumulative budget %d bytes (used %d)", e.Field, e.Declared, e.Limit, e.Used)
+	default:
+		return fmt.Sprintf("colfer: field %s declared length %d overflows address space", e.Field, e.Declared)
+	}
+}
+
+// ColferBudget propagates ColferDecodeLimits through nested struct decoding,
+// possibly across generated packages. The interface is implemented by the
+// generated code itself; callers use ColferDecodeLimits with UnmarshalLimited.
+type ColferBudget interface {
+	// EnterStruct charges one nesting level for field.
+	EnterStruct(field string) error
+	// LeaveStruct releases the nesting marker set by EnterStruct. Consumption
+	// is never refunded.
+	LeaveStruct()
+	// ChargeList charges n elements for field (a list field or a nested list
+	// element path such as "os[3]").
+	ChargeList(field string, n uint64) error
+	// ChargeBytes charges n variable-length bytes for field.
+	ChargeBytes(field string, n uint64) error
+}
+
+// colferBudget is the per-Unmarshal resource state.
+type colferBudget struct {
+	limits    ColferDecodeLimits
+	depth     int
+	listElems uint64
+	varBytes  uint64
+	path      []string
+	pathBuf   [8]string
+}
+
+func newColferBudget(limits ColferDecodeLimits, root string) *colferBudget {
+	b := &colferBudget{limits: limits}
+	b.path = b.pathBuf[:0]
+	b.path = append(b.path, root)
+	return b
+}
+
+// fieldPath returns the schema path for a field name relative to the current
+// nesting level.
+func (b *colferBudget) fieldPath(field string) string {
+	if field == "" {
+		return strings.Join(b.path, ".")
+	}
+	return strings.Join(append(append([]string{}, b.path...), field), ".")
+}
+
+// EnterStruct honors the ColferBudget interface.
+func (b *colferBudget) EnterStruct(field string) error {
+	if b.limits.MaxDepth != 0 && b.depth >= b.limits.MaxDepth {
+		return &ColferLimitError{
+			Kind:  ColferLimitDepth,
+			Field: b.fieldPath(field),
+			Limit: uint64(b.limits.MaxDepth),
+			Used:  uint64(b.depth),
+		}
+	}
+	b.depth++
+	b.path = append(b.path, field)
+	return nil
+}
+
+// LeaveStruct honors the ColferBudget interface.
+func (b *colferBudget) LeaveStruct() {
+	b.depth--
+	b.path = b.path[:len(b.path)-1]
+}
+
+// ChargeList honors the ColferBudget interface.
+func (b *colferBudget) ChargeList(field string, n uint64) error {
+	if b.limits.MaxListElements != 0 {
+		used := b.listElems
+		if n > b.limits.MaxListElements-used {
+			return &ColferLimitError{
+				Kind:     ColferLimitListElements,
+				Field:    b.fieldPath(field),
+				Limit:    b.limits.MaxListElements,
+				Used:     used,
+				Declared: n,
+			}
+		}
+		b.listElems = used + n
+	}
+	return nil
+}
+
+// ChargeBytes honors the ColferBudget interface.
+func (b *colferBudget) ChargeBytes(field string, n uint64) error {
+	if b.limits.MaxVarBytes != 0 {
+		used := b.varBytes
+		if n > b.limits.MaxVarBytes-used {
+			return &ColferLimitError{
+				Kind:     ColferLimitVarBytes,
+				Field:    b.fieldPath(field),
+				Limit:    b.limits.MaxVarBytes,
+				Used:     used,
+				Declared: n,
+			}
+		}
+		b.varBytes = used + n
+	}
+	return nil
+}
+
+// colferMaxInt is the largest addressable slice length on the runtime.
+const colferMaxInt = uint64(^uint(0) >> 1)
+
+// colferLengthOverflow rejects a declared length before any allocation. The
+// field path is static at the call site and rooted in the schema struct.
+func colferLengthOverflow(field string, declared uint64) error {
+	return &ColferLimitError{
+		Kind:     ColferLimitLengthOverflow,
+		Field:    field,
+		Declared: declared,
+	}
 }
 
 // Header is a prefix for requests and responses.
@@ -178,8 +374,45 @@ func (o *Header) MarshalBinary() (data []byte, err error) {
 }
 
 // Unmarshal decodes data as Colfer and returns the number of bytes read.
+// Limits remain at the package defaults (ColferSizeMax and ColferListMax).
+// The receiver is left untouched when an error is returned.
 // The error return options are io.EOF, ColferError and ColferMax.
 func (o *Header) Unmarshal(data []byte) (int, error) {
+	return o.unmarshal(data, nil)
+}
+
+// UnmarshalLimited decodes data as Colfer under limits and returns the number
+// of bytes read. A zero-valued limits entry disables that budget. The limits
+// apply cumulatively to every field, including nested structs and all of their
+// lists and variable-length data. Consumed budget is never restored, not even
+// after a backtrack or a field failure. The receiver is left untouched when an
+// error is returned.
+// The error return options are io.EOF, ColferError, ColferMax and
+// *ColferLimitError.
+func (o *Header) UnmarshalLimited(data []byte, limits ColferDecodeLimits) (int, error) {
+	return o.unmarshal(data, newColferBudget(limits, "internal.header"))
+}
+
+// UnmarshalBudget decodes data as Colfer with a shared budget that originates
+// in another generated package. The method allows limits to propagate through
+// cross-package struct references. Callers normally use UnmarshalLimited.
+func (o *Header) UnmarshalBudget(data []byte, budget ColferBudget) (int, error) {
+	return o.unmarshal(data, budget)
+}
+
+// unmarshal decodes data as Colfer and returns the number of bytes read.
+// A nil budget leaves the cumulative limits disabled.
+func (o *Header) unmarshal(data []byte, budget ColferBudget) (int, error) {
+	// The target may not end up in a half-new, half-old state on failure.
+	saved := *o
+	n, err := o.colferDecode(data, budget)
+	if err != nil {
+		*o = saved
+	}
+	return n, err
+}
+
+func (o *Header) colferDecode(data []byte, budget ColferBudget) (int, error) {
 	if len(data) == 0 {
 		return 0, io.EOF
 	}
@@ -249,8 +482,16 @@ func (o *Header) Unmarshal(data []byte) (int, error) {
 			}
 		}
 
+		if uint64(x) > colferMaxInt {
+			return 0, colferLengthOverflow("internal.header.method", uint64(x))
+		}
 		if x > uint(ColferSizeMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: internal.header.method size %d exceeds %d bytes", x, ColferSizeMax))
+		}
+		if budget != nil {
+			if err := budget.ChargeBytes("method", uint64(x)); err != nil {
+				return 0, err
+			}
 		}
 
 		start := i
@@ -288,8 +529,16 @@ func (o *Header) Unmarshal(data []byte) (int, error) {
 			}
 		}
 
+		if uint64(x) > colferMaxInt {
+			return 0, colferLengthOverflow("internal.header.error", uint64(x))
+		}
 		if x > uint(ColferSizeMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: internal.header.error size %d exceeds %d bytes", x, ColferSizeMax))
+		}
+		if budget != nil {
+			if err := budget.ChargeBytes("error", uint64(x)); err != nil {
+				return 0, err
+			}
 		}
 
 		start := i
@@ -359,6 +608,18 @@ eof:
 // The error return options are io.EOF, ColferError, ColferTail and ColferMax.
 func (o *Header) UnmarshalBinary(data []byte) error {
 	i, err := o.Unmarshal(data)
+	if i < len(data) && err == nil {
+		return ColferTail(i)
+	}
+	return err
+}
+
+// UnmarshalBinaryLimited decodes data as Colfer under limits conform
+// encoding.BinaryUnmarshaler. The receiver is left untouched on error.
+// The error return options are io.EOF, ColferError, ColferTail, ColferMax and
+// *ColferLimitError.
+func (o *Header) UnmarshalBinaryLimited(data []byte, limits ColferDecodeLimits) error {
+	i, err := o.UnmarshalLimited(data, limits)
 	if i < len(data) && err == nil {
 		return ColferTail(i)
 	}
