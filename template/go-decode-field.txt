@@ -1,0 +1,390 @@
+{{if eq .Type "bool"}}
+{{else if eq .Type "uint8"}}
+	case {{add .Index 1}}:
+		if !d.fixed(data, &n) {
+			return n, nil, nil
+		}
+		d.o.{{.NameNative}} = d.fix[0]
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{else if eq .Type "uint16"}}
+	case {{add .Index 1}}:
+		if !d.fixed(data, &n) {
+			return n, nil, nil
+		}
+		if d.hdr == {{.Index}}|0x80 {
+			d.o.{{.NameNative}} = uint16(d.fix[0])
+		} else {
+			d.o.{{.NameNative}} = intconv.Uint16(d.fix[:])
+		}
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{else if eq .Type "uint32"}}
+	case {{add .Index 1}}:
+		if d.hdr == {{.Index}}|0x80 {
+			if !d.fixed(data, &n) {
+				return n, nil, nil
+			}
+			d.o.{{.NameNative}} = intconv.Uint32(d.fix[:])
+		} else {
+			if !d.varint(data, &n, false) {
+				return n, nil, nil
+			}
+			d.o.{{.NameNative}} = uint32(d.x)
+		}
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{else if eq .Type "uint64"}}
+	case {{add .Index 1}}:
+		if d.hdr == {{.Index}}|0x80 {
+			if !d.fixed(data, &n) {
+				return n, nil, nil
+			}
+			d.o.{{.NameNative}} = intconv.Uint64(d.fix[:])
+		} else {
+			if !d.varint(data, &n, true) {
+				return n, nil, nil
+			}
+			d.o.{{.NameNative}} = d.x
+		}
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{else if eq .Type "int32"}}
+{{- if .TypeList}}
+	case {{add .Index 1}}:
+		if d.step == 0 {
+			if !d.varint(data, &n, false) {
+				return n, nil, nil
+			}
+			if x := uint(d.x); x > uint(ColferListMax) {
+				return n, nil, ColferMax(fmt.Sprintf("colfer: {{.String}} length %d exceeds %d elements", x, ColferListMax))
+			}
+			d.o.{{.NameNative}} = make([]int32, int(d.x))
+			d.idx = 0
+			d.step = 1
+		}
+		for d.idx < len(d.o.{{.NameNative}}) {
+			if !d.varint(data, &n, false) {
+				return n, nil, nil
+			}
+			x := uint(d.x)
+			d.o.{{.NameNative}}[d.idx] = int32((x >> 1) ^ (-(x & 1)))
+			d.idx++
+		}
+		d.step = 0
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{- else}}
+	case {{add .Index 1}}:
+		if !d.varint(data, &n, false) {
+			return n, nil, nil
+		}
+		if d.hdr == {{.Index}}|0x80 {
+			d.o.{{.NameNative}} = int32(^uint32(d.x) + 1)
+		} else {
+			d.o.{{.NameNative}} = int32(d.x)
+		}
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{- end}}
+{{else if eq .Type "int64"}}
+{{- if .TypeList}}
+	case {{add .Index 1}}:
+		if d.step == 0 {
+			if !d.varint(data, &n, true) {
+				return n, nil, nil
+			}
+			if x := uint(d.x); x > uint(ColferListMax) {
+				return n, nil, ColferMax(fmt.Sprintf("colfer: {{.String}} length %d exceeds %d elements", x, ColferListMax))
+			}
+			d.o.{{.NameNative}} = make([]int64, int(d.x))
+			d.idx = 0
+			d.step = 1
+		}
+		for d.idx < len(d.o.{{.NameNative}}) {
+			if !d.varint(data, &n, true) {
+				return n, nil, nil
+			}
+			x := d.x
+			d.o.{{.NameNative}}[d.idx] = int64((x >> 1) ^ (-(x & 1)))
+			d.idx++
+		}
+		d.step = 0
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{- else}}
+	case {{add .Index 1}}:
+		if !d.varint(data, &n, true) {
+			return n, nil, nil
+		}
+		if d.hdr == {{.Index}}|0x80 {
+			d.o.{{.NameNative}} = int64(^d.x + 1)
+		} else {
+			d.o.{{.NameNative}} = int64(d.x)
+		}
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{- end}}
+{{else if eq .Type "float32"}}
+{{- if .TypeList}}
+	case {{add .Index 1}}:
+		if d.step == 0 {
+			if !d.varint(data, &n, false) {
+				return n, nil, nil
+			}
+			if x := uint(d.x); x > uint(ColferListMax) {
+				return n, nil, ColferMax(fmt.Sprintf("colfer: {{.String}} length %d exceeds %d elements", x, ColferListMax))
+			}
+			d.o.{{.NameNative}} = make([]float32, int(d.x))
+			d.idx = 0
+			d.need = 4
+			d.step = 1
+		}
+		for d.idx < len(d.o.{{.NameNative}}) {
+			if !d.fixed(data, &n) {
+				return n, nil, nil
+			}
+			d.o.{{.NameNative}}[d.idx] = math.Float32frombits(intconv.Uint32(d.fix[:]))
+			d.idx++
+			d.need = 4
+		}
+		d.step = 0
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{- else}}
+	case {{add .Index 1}}:
+		if !d.fixed(data, &n) {
+			return n, nil, nil
+		}
+		d.o.{{.NameNative}} = math.Float32frombits(intconv.Uint32(d.fix[:]))
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{- end}}
+{{else if eq .Type "float64"}}
+{{- if .TypeList}}
+	case {{add .Index 1}}:
+		if d.step == 0 {
+			if !d.varint(data, &n, false) {
+				return n, nil, nil
+			}
+			if x := uint(d.x); x > uint(ColferListMax) {
+				return n, nil, ColferMax(fmt.Sprintf("colfer: {{.String}} length %d exceeds %d elements", x, ColferListMax))
+			}
+			d.o.{{.NameNative}} = make([]float64, int(d.x))
+			d.idx = 0
+			d.need = 8
+			d.step = 1
+		}
+		for d.idx < len(d.o.{{.NameNative}}) {
+			if !d.fixed(data, &n) {
+				return n, nil, nil
+			}
+			d.o.{{.NameNative}}[d.idx] = math.Float64frombits(intconv.Uint64(d.fix[:]))
+			d.idx++
+			d.need = 8
+		}
+		d.step = 0
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{- else}}
+	case {{add .Index 1}}:
+		if !d.fixed(data, &n) {
+			return n, nil, nil
+		}
+		d.o.{{.NameNative}} = math.Float64frombits(intconv.Uint64(d.fix[:]))
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{- end}}
+{{else if eq .Type "timestamp"}}
+	case {{add .Index 1}}:
+		if !d.fixed(data, &n) {
+			return n, nil, nil
+		}
+		if d.hdr == {{.Index}}|0x80 {
+			d.o.{{.NameNative}} = time.Unix(int64(intconv.Uint64(d.fix[:])), int64(intconv.Uint32(d.fix[8:]))).In(time.UTC)
+		} else {
+			d.o.{{.NameNative}} = time.Unix(int64(intconv.Uint32(d.fix[:])), int64(intconv.Uint32(d.fix[4:]))).In(time.UTC)
+		}
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{else if eq .Type "text"}}
+{{- if .TypeList}}
+	case {{add .Index 1}}:
+		if d.step == 0 {
+			if !d.varint(data, &n, false) {
+				return n, nil, nil
+			}
+			if x := uint(d.x); x > uint(ColferListMax) {
+				return n, nil, ColferMax(fmt.Sprintf("colfer: {{.String}} length %d exceeds %d elements", x, ColferListMax))
+			}
+			d.o.{{.NameNative}} = make([]string, int(d.x))
+			d.idx = 0
+			d.step = 1
+		}
+		for d.idx < len(d.o.{{.NameNative}}) {
+			if d.step == 1 {
+				if !d.varint(data, &n, false) {
+					return n, nil, nil
+				}
+				if x := uint(d.x); x > uint(ColferSizeMax) {
+					return n, nil, ColferMax(fmt.Sprintf("colfer: {{.String}} element %d size %d exceeds %d bytes", d.idx, x, ColferSizeMax))
+				}
+				d.need = int(d.x)
+				d.buf = make([]byte, 0, d.need)
+				d.step = 2
+			}
+			if !d.content(data, &n) {
+				return n, nil, nil
+			}
+			d.o.{{.NameNative}}[d.idx] = string(d.buf)
+			d.idx++
+			d.step = 1
+		}
+		d.step = 0
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{- else}}
+	case {{add .Index 1}}:
+		if d.step == 0 {
+			if !d.varint(data, &n, false) {
+				return n, nil, nil
+			}
+			if x := uint(d.x); x > uint(ColferSizeMax) {
+				return n, nil, ColferMax(fmt.Sprintf("colfer: {{.String}} size %d exceeds %d bytes", x, ColferSizeMax))
+			}
+			d.need = int(d.x)
+			d.buf = make([]byte, 0, d.need)
+			d.step = 1
+		}
+		if !d.content(data, &n) {
+			return n, nil, nil
+		}
+		d.o.{{.NameNative}} = string(d.buf)
+		d.step = 0
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{- end}}
+{{else if eq .Type "binary"}}
+{{- if .TypeList}}
+	case {{add .Index 1}}:
+		if d.step == 0 {
+			if !d.varint(data, &n, false) {
+				return n, nil, nil
+			}
+			if x := uint(d.x); x > uint(ColferListMax) {
+				return n, nil, ColferMax(fmt.Sprintf("colfer: {{.String}} length %d exceeds %d elements", x, ColferListMax))
+			}
+			d.o.{{.NameNative}} = make([][]byte, int(d.x))
+			d.idx = 0
+			d.step = 1
+		}
+		for d.idx < len(d.o.{{.NameNative}}) {
+			if d.step == 1 {
+				if !d.varint(data, &n, false) {
+					return n, nil, nil
+				}
+				if x := uint(d.x); x > uint(ColferSizeMax) {
+					return n, nil, ColferMax(fmt.Sprintf("colfer: {{.String}} element %d size %d exceeds %d bytes", d.idx, x, ColferSizeMax))
+				}
+				d.need = int(d.x)
+				d.buf = make([]byte, 0, d.need)
+				d.step = 2
+			}
+			if !d.content(data, &n) {
+				return n, nil, nil
+			}
+			d.o.{{.NameNative}}[d.idx] = d.buf
+			d.idx++
+			d.step = 1
+		}
+		d.step = 0
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{- else}}
+	case {{add .Index 1}}:
+		if d.step == 0 {
+			if !d.varint(data, &n, false) {
+				return n, nil, nil
+			}
+			if x := uint(d.x); x > uint(ColferSizeMax) {
+				return n, nil, ColferMax(fmt.Sprintf("colfer: {{.String}} size %d exceeds %d bytes", x, ColferSizeMax))
+			}
+			d.need = int(d.x)
+			d.buf = make([]byte, 0, d.need)
+			d.step = 1
+		}
+		if !d.content(data, &n) {
+			return n, nil, nil
+		}
+		d.o.{{.NameNative}} = d.buf
+		d.step = 0
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{- end}}
+{{else if .TypeList}}
+	case {{add .Index 1}}:
+		if d.step == 0 {
+			if !d.varint(data, &n, false) {
+				return n, nil, nil
+			}
+			if x := uint(d.x); x > uint(ColferListMax) {
+				return n, nil, ColferMax(fmt.Sprintf("colfer: {{.String}} length %d exceeds %d elements", x, ColferListMax))
+			}
+			d.o.{{.NameNative}} = make([]*{{.TypeNative}}, int(d.x))
+			d.idx = 0
+			d.step = 1
+		}
+		for d.idx < len(d.o.{{.NameNative}}) {
+			if d.sub{{.NameNative}} == nil {
+				d.sub{{.NameNative}} = new({{.TypeNative}}Decoder)
+			}
+			sn, so, serr := d.sub{{.NameNative}}.Feed(data[n:])
+			n += sn
+			if serr != nil {
+				return n, nil, serr
+			}
+			if so == nil {
+				return n, nil, nil
+			}
+			d.o.{{.NameNative}}[d.idx] = so
+			d.idx++
+		}
+		d.step = 0
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{else}}
+	case {{add .Index 1}}:
+		if d.sub{{.NameNative}} == nil {
+			d.sub{{.NameNative}} = new({{.TypeNative}}Decoder)
+		}
+		sn, so, serr := d.sub{{.NameNative}}.Feed(data[n:])
+		n += sn
+		if serr != nil {
+			return n, nil, serr
+		}
+		if so == nil {
+			return n, nil, nil
+		}
+		d.o.{{.NameNative}} = so
+		d.state = 0
+		d.next = {{add .Index 1}}
+		continue
+{{end}}

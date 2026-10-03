@@ -1,0 +1,94 @@
+{{if eq .Type "bool"}}
+	if d.hdr == {{.Index}} && d.next <= {{.Index}} {
+		d.o.{{.NameNative}} = true
+		d.next = {{add .Index 1}}
+		continue
+	}
+{{else if eq .Type "uint8"}}
+	if d.hdr == {{.Index}} && d.next <= {{.Index}} {
+		d.need = 1
+		d.state = {{add .Index 1}}
+		continue
+	}
+{{else if eq .Type "uint16"}}
+	if d.hdr == {{.Index}} && d.next <= {{.Index}} {
+		d.need = 2
+		d.state = {{add .Index 1}}
+		continue
+	}
+	if d.hdr == {{.Index}}|0x80 && d.next <= {{.Index}} {
+		d.need = 1
+		d.state = {{add .Index 1}}
+		continue
+	}
+{{else if eq .Type "uint32"}}
+	if d.hdr == {{.Index}} && d.next <= {{.Index}} {
+		d.state = {{add .Index 1}}
+		continue
+	}
+	if d.hdr == {{.Index}}|0x80 && d.next <= {{.Index}} {
+		d.need = 4
+		d.state = {{add .Index 1}}
+		continue
+	}
+{{else if eq .Type "uint64"}}
+	if d.hdr == {{.Index}} && d.next <= {{.Index}} {
+		d.state = {{add .Index 1}}
+		continue
+	}
+	if d.hdr == {{.Index}}|0x80 && d.next <= {{.Index}} {
+		d.need = 8
+		d.state = {{add .Index 1}}
+		continue
+	}
+{{else if eq .Type "int32"}}
+	if d.hdr == {{.Index}} && d.next <= {{.Index}} {
+		d.state = {{add .Index 1}}
+		continue
+	}
+	{{- if not .TypeList}}
+	if d.hdr == {{.Index}}|0x80 && d.next <= {{.Index}} {
+		d.state = {{add .Index 1}}
+		continue
+	}
+	{{- end}}
+{{else if eq .Type "int64"}}
+	if d.hdr == {{.Index}} && d.next <= {{.Index}} {
+		d.state = {{add .Index 1}}
+		continue
+	}
+	{{- if not .TypeList}}
+	if d.hdr == {{.Index}}|0x80 && d.next <= {{.Index}} {
+		d.state = {{add .Index 1}}
+		continue
+	}
+	{{- end}}
+{{else if eq .Type "float32"}}
+	if d.hdr == {{.Index}} && d.next <= {{.Index}} {
+		d.need = 4
+		d.state = {{add .Index 1}}
+		continue
+	}
+{{else if eq .Type "float64"}}
+	if d.hdr == {{.Index}} && d.next <= {{.Index}} {
+		d.need = 8
+		d.state = {{add .Index 1}}
+		continue
+	}
+{{else if eq .Type "timestamp"}}
+	if d.hdr == {{.Index}} && d.next <= {{.Index}} {
+		d.need = 8
+		d.state = {{add .Index 1}}
+		continue
+	}
+	if d.hdr == {{.Index}}|0x80 && d.next <= {{.Index}} {
+		d.need = 12
+		d.state = {{add .Index 1}}
+		continue
+	}
+{{else}}
+	if d.hdr == {{.Index}} && d.next <= {{.Index}} {
+		d.state = {{add .Index 1}}
+		continue
+	}
+{{end}}

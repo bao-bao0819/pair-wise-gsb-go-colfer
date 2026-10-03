@@ -44,6 +44,100 @@ func (i ColferTail) Error() string {
 	return fmt.Sprintf("colfer: data continuation at byte %d", i)
 }
 
+// A colferDecoder holds the resumable state for incremental decoding.
+// The struct decoders of the package each embed one instance.
+type colferDecoder struct {
+	state int
+	next  int
+	step  int
+	hdr   byte
+	x     uint64
+	sh    uint
+	need  int
+	have  int
+	fix   [12]byte
+	buf   []byte
+	idx   int
+	total int
+	err   error
+}
+
+// Varint consumes variable-length integer bytes from data and returns
+// whether the value is complete. The accumulated value is in d.x.
+func (d *colferDecoder) varint(data []byte, n *int, cap56 bool) bool {
+	if d.sh == 0 {
+		if *n >= len(data) {
+			return false
+		}
+		b := data[*n]
+		*n++
+		if b < 0x80 {
+			d.x = uint64(b)
+			return true
+		}
+		d.x = uint64(b & 0x7f)
+		d.sh = 7
+	}
+	for {
+		if *n >= len(data) {
+			return false
+		}
+		b := uint64(data[*n])
+		*n++
+		if b < 0x80 || (cap56 && d.sh == 56) {
+			d.x |= b << d.sh
+			d.sh = 0
+			return true
+		}
+		d.x |= (b & 0x7f) << d.sh
+		d.sh += 7
+	}
+}
+
+// Fixed consumes d.need bytes from data into d.fix and returns whether the
+// segment is complete.
+func (d *colferDecoder) fixed(data []byte, n *int) bool {
+	take := d.need
+	if r := len(data) - *n; take > r {
+		take = r
+	}
+	copy(d.fix[d.have:], data[*n:*n+take])
+	d.have += take
+	d.need -= take
+	*n += take
+	if d.need != 0 {
+		return false
+	}
+	d.have = 0
+	return true
+}
+
+// Content consumes d.need bytes from data into d.buf and returns whether the
+// segment is complete.
+func (d *colferDecoder) content(data []byte, n *int) bool {
+	take := d.need
+	if r := len(data) - *n; take > r {
+		take = r
+	}
+	d.buf = append(d.buf, data[*n:*n+take]...)
+	d.need -= take
+	*n += take
+	return d.need == 0
+}
+
+// Close signals the end of input. The return is io.ErrUnexpectedEOF when a
+// record is incomplete, or the sticky error when the decoder failed before.
+func (d *colferDecoder) Close() error {
+	if d.err != nil {
+		return d.err
+	}
+	if d.state != 0 || d.next != 0 {
+		d.err = io.ErrUnexpectedEOF
+		return d.err
+	}
+	return nil
+}
+
 // O contains all supported data types.
 type O struct {
 	// B tests booleans.
@@ -1249,6 +1343,522 @@ func (o *O) UnmarshalBinary(data []byte) error {
 	return err
 }
 
+// ODecoder decodes O records from a data stream,
+// e.g. a network connection. The zero value is ready to use.
+type ODecoder struct {
+	colferDecoder
+	o     O
+	subO  *ODecoder
+	subOs *ODecoder
+}
+
+// Reset clears the decoder state. The decoder is ready for a new record,
+// also after a failure.
+func (d *ODecoder) Reset() {
+	*d = ODecoder{}
+}
+
+// Feed consumes bytes from data and returns the number of bytes read.
+// The object return is nil until a record completes. Any bytes beyond the
+// end of the record are left for the next Feed invocation.
+// The error return options are ColferError and ColferMax. The decoder keeps
+// a failure state after an error until Reset.
+func (d *ODecoder) Feed(data []byte) (int, *O, error) {
+	if d.err != nil {
+		return 0, nil, d.err
+	}
+	n, obj, err := d.feed(data)
+	d.total += n
+	if err != nil {
+		d.err = err
+		return n, nil, err
+	}
+	if d.total+d.need >= ColferSizeMax {
+		d.err = ColferMax(fmt.Sprintf("colfer: struct gen.o size exceeds %d bytes", ColferSizeMax))
+		return n, nil, d.err
+	}
+	if obj != nil {
+		d.total = 0
+	}
+	return n, obj, nil
+}
+
+func (d *ODecoder) feed(data []byte) (int, *O, error) {
+	var n int
+	for {
+		switch d.state {
+		case 0:
+			if n >= len(data) {
+				return n, nil, nil
+			}
+			d.hdr = data[n]
+			n++
+
+			if d.hdr == 0 && d.next <= 0 {
+				d.o.B = true
+				d.next = 1
+				continue
+			}
+
+			if d.hdr == 1 && d.next <= 1 {
+				d.state = 2
+				continue
+			}
+			if d.hdr == 1|0x80 && d.next <= 1 {
+				d.need = 4
+				d.state = 2
+				continue
+			}
+
+			if d.hdr == 2 && d.next <= 2 {
+				d.state = 3
+				continue
+			}
+			if d.hdr == 2|0x80 && d.next <= 2 {
+				d.need = 8
+				d.state = 3
+				continue
+			}
+
+			if d.hdr == 3 && d.next <= 3 {
+				d.state = 4
+				continue
+			}
+			if d.hdr == 3|0x80 && d.next <= 3 {
+				d.state = 4
+				continue
+			}
+
+			if d.hdr == 4 && d.next <= 4 {
+				d.state = 5
+				continue
+			}
+			if d.hdr == 4|0x80 && d.next <= 4 {
+				d.state = 5
+				continue
+			}
+
+			if d.hdr == 5 && d.next <= 5 {
+				d.need = 4
+				d.state = 6
+				continue
+			}
+
+			if d.hdr == 6 && d.next <= 6 {
+				d.need = 8
+				d.state = 7
+				continue
+			}
+
+			if d.hdr == 7 && d.next <= 7 {
+				d.need = 8
+				d.state = 8
+				continue
+			}
+			if d.hdr == 7|0x80 && d.next <= 7 {
+				d.need = 12
+				d.state = 8
+				continue
+			}
+
+			if d.hdr == 8 && d.next <= 8 {
+				d.state = 9
+				continue
+			}
+
+			if d.hdr == 9 && d.next <= 9 {
+				d.state = 10
+				continue
+			}
+
+			if d.hdr == 10 && d.next <= 10 {
+				d.state = 11
+				continue
+			}
+
+			if d.hdr == 11 && d.next <= 11 {
+				d.state = 12
+				continue
+			}
+
+			if d.hdr == 12 && d.next <= 12 {
+				d.state = 13
+				continue
+			}
+
+			if d.hdr == 13 && d.next <= 13 {
+				d.state = 14
+				continue
+			}
+
+			if d.hdr == 14 && d.next <= 14 {
+				d.need = 1
+				d.state = 15
+				continue
+			}
+
+			if d.hdr == 15 && d.next <= 15 {
+				d.need = 2
+				d.state = 16
+				continue
+			}
+			if d.hdr == 15|0x80 && d.next <= 15 {
+				d.need = 1
+				d.state = 16
+				continue
+			}
+
+			if d.hdr == 16 && d.next <= 16 {
+				d.need = 4
+				d.state = 17
+				continue
+			}
+
+			if d.hdr == 17 && d.next <= 17 {
+				d.need = 8
+				d.state = 18
+				continue
+			}
+
+			if d.hdr != 0x7f {
+				return n, nil, ColferError(d.total + n - 1)
+			}
+			obj := new(O)
+			*obj = d.o
+			d.o = O{}
+			d.next = 0
+			return n, obj, nil
+
+		case 2:
+			if d.hdr == 1|0x80 {
+				if !d.fixed(data, &n) {
+					return n, nil, nil
+				}
+				d.o.U32 = intconv.Uint32(d.fix[:])
+			} else {
+				if !d.varint(data, &n, false) {
+					return n, nil, nil
+				}
+				d.o.U32 = uint32(d.x)
+			}
+			d.state = 0
+			d.next = 2
+			continue
+
+		case 3:
+			if d.hdr == 2|0x80 {
+				if !d.fixed(data, &n) {
+					return n, nil, nil
+				}
+				d.o.U64 = intconv.Uint64(d.fix[:])
+			} else {
+				if !d.varint(data, &n, true) {
+					return n, nil, nil
+				}
+				d.o.U64 = d.x
+			}
+			d.state = 0
+			d.next = 3
+			continue
+
+		case 4:
+			if !d.varint(data, &n, false) {
+				return n, nil, nil
+			}
+			if d.hdr == 3|0x80 {
+				d.o.I32 = int32(^uint32(d.x) + 1)
+			} else {
+				d.o.I32 = int32(d.x)
+			}
+			d.state = 0
+			d.next = 4
+			continue
+
+		case 5:
+			if !d.varint(data, &n, true) {
+				return n, nil, nil
+			}
+			if d.hdr == 4|0x80 {
+				d.o.I64 = int64(^d.x + 1)
+			} else {
+				d.o.I64 = int64(d.x)
+			}
+			d.state = 0
+			d.next = 5
+			continue
+
+		case 6:
+			if !d.fixed(data, &n) {
+				return n, nil, nil
+			}
+			d.o.F32 = math.Float32frombits(intconv.Uint32(d.fix[:]))
+			d.state = 0
+			d.next = 6
+			continue
+
+		case 7:
+			if !d.fixed(data, &n) {
+				return n, nil, nil
+			}
+			d.o.F64 = math.Float64frombits(intconv.Uint64(d.fix[:]))
+			d.state = 0
+			d.next = 7
+			continue
+
+		case 8:
+			if !d.fixed(data, &n) {
+				return n, nil, nil
+			}
+			if d.hdr == 7|0x80 {
+				d.o.T = time.Unix(int64(intconv.Uint64(d.fix[:])), int64(intconv.Uint32(d.fix[8:]))).In(time.UTC)
+			} else {
+				d.o.T = time.Unix(int64(intconv.Uint32(d.fix[:])), int64(intconv.Uint32(d.fix[4:]))).In(time.UTC)
+			}
+			d.state = 0
+			d.next = 8
+			continue
+
+		case 9:
+			if d.step == 0 {
+				if !d.varint(data, &n, false) {
+					return n, nil, nil
+				}
+				if x := uint(d.x); x > uint(ColferSizeMax) {
+					return n, nil, ColferMax(fmt.Sprintf("colfer: gen.o.s size %d exceeds %d bytes", x, ColferSizeMax))
+				}
+				d.need = int(d.x)
+				d.buf = make([]byte, 0, d.need)
+				d.step = 1
+			}
+			if !d.content(data, &n) {
+				return n, nil, nil
+			}
+			d.o.S = string(d.buf)
+			d.step = 0
+			d.state = 0
+			d.next = 9
+			continue
+
+		case 10:
+			if d.step == 0 {
+				if !d.varint(data, &n, false) {
+					return n, nil, nil
+				}
+				if x := uint(d.x); x > uint(ColferSizeMax) {
+					return n, nil, ColferMax(fmt.Sprintf("colfer: gen.o.a size %d exceeds %d bytes", x, ColferSizeMax))
+				}
+				d.need = int(d.x)
+				d.buf = make([]byte, 0, d.need)
+				d.step = 1
+			}
+			if !d.content(data, &n) {
+				return n, nil, nil
+			}
+			d.o.A = d.buf
+			d.step = 0
+			d.state = 0
+			d.next = 10
+			continue
+
+		case 11:
+			if d.subO == nil {
+				d.subO = new(ODecoder)
+			}
+			sn, so, serr := d.subO.Feed(data[n:])
+			n += sn
+			if serr != nil {
+				return n, nil, serr
+			}
+			if so == nil {
+				return n, nil, nil
+			}
+			d.o.O = so
+			d.state = 0
+			d.next = 11
+			continue
+
+		case 12:
+			if d.step == 0 {
+				if !d.varint(data, &n, false) {
+					return n, nil, nil
+				}
+				if x := uint(d.x); x > uint(ColferListMax) {
+					return n, nil, ColferMax(fmt.Sprintf("colfer: gen.o.os length %d exceeds %d elements", x, ColferListMax))
+				}
+				d.o.Os = make([]*O, int(d.x))
+				d.idx = 0
+				d.step = 1
+			}
+			for d.idx < len(d.o.Os) {
+				if d.subOs == nil {
+					d.subOs = new(ODecoder)
+				}
+				sn, so, serr := d.subOs.Feed(data[n:])
+				n += sn
+				if serr != nil {
+					return n, nil, serr
+				}
+				if so == nil {
+					return n, nil, nil
+				}
+				d.o.Os[d.idx] = so
+				d.idx++
+			}
+			d.step = 0
+			d.state = 0
+			d.next = 12
+			continue
+
+		case 13:
+			if d.step == 0 {
+				if !d.varint(data, &n, false) {
+					return n, nil, nil
+				}
+				if x := uint(d.x); x > uint(ColferListMax) {
+					return n, nil, ColferMax(fmt.Sprintf("colfer: gen.o.ss length %d exceeds %d elements", x, ColferListMax))
+				}
+				d.o.Ss = make([]string, int(d.x))
+				d.idx = 0
+				d.step = 1
+			}
+			for d.idx < len(d.o.Ss) {
+				if d.step == 1 {
+					if !d.varint(data, &n, false) {
+						return n, nil, nil
+					}
+					if x := uint(d.x); x > uint(ColferSizeMax) {
+						return n, nil, ColferMax(fmt.Sprintf("colfer: gen.o.ss element %d size %d exceeds %d bytes", d.idx, x, ColferSizeMax))
+					}
+					d.need = int(d.x)
+					d.buf = make([]byte, 0, d.need)
+					d.step = 2
+				}
+				if !d.content(data, &n) {
+					return n, nil, nil
+				}
+				d.o.Ss[d.idx] = string(d.buf)
+				d.idx++
+				d.step = 1
+			}
+			d.step = 0
+			d.state = 0
+			d.next = 13
+			continue
+
+		case 14:
+			if d.step == 0 {
+				if !d.varint(data, &n, false) {
+					return n, nil, nil
+				}
+				if x := uint(d.x); x > uint(ColferListMax) {
+					return n, nil, ColferMax(fmt.Sprintf("colfer: gen.o.as length %d exceeds %d elements", x, ColferListMax))
+				}
+				d.o.As = make([][]byte, int(d.x))
+				d.idx = 0
+				d.step = 1
+			}
+			for d.idx < len(d.o.As) {
+				if d.step == 1 {
+					if !d.varint(data, &n, false) {
+						return n, nil, nil
+					}
+					if x := uint(d.x); x > uint(ColferSizeMax) {
+						return n, nil, ColferMax(fmt.Sprintf("colfer: gen.o.as element %d size %d exceeds %d bytes", d.idx, x, ColferSizeMax))
+					}
+					d.need = int(d.x)
+					d.buf = make([]byte, 0, d.need)
+					d.step = 2
+				}
+				if !d.content(data, &n) {
+					return n, nil, nil
+				}
+				d.o.As[d.idx] = d.buf
+				d.idx++
+				d.step = 1
+			}
+			d.step = 0
+			d.state = 0
+			d.next = 14
+			continue
+
+		case 15:
+			if !d.fixed(data, &n) {
+				return n, nil, nil
+			}
+			d.o.U8 = d.fix[0]
+			d.state = 0
+			d.next = 15
+			continue
+
+		case 16:
+			if !d.fixed(data, &n) {
+				return n, nil, nil
+			}
+			if d.hdr == 15|0x80 {
+				d.o.U16 = uint16(d.fix[0])
+			} else {
+				d.o.U16 = intconv.Uint16(d.fix[:])
+			}
+			d.state = 0
+			d.next = 16
+			continue
+
+		case 17:
+			if d.step == 0 {
+				if !d.varint(data, &n, false) {
+					return n, nil, nil
+				}
+				if x := uint(d.x); x > uint(ColferListMax) {
+					return n, nil, ColferMax(fmt.Sprintf("colfer: gen.o.f32s length %d exceeds %d elements", x, ColferListMax))
+				}
+				d.o.F32s = make([]float32, int(d.x))
+				d.idx = 0
+				d.need = 4
+				d.step = 1
+			}
+			for d.idx < len(d.o.F32s) {
+				if !d.fixed(data, &n) {
+					return n, nil, nil
+				}
+				d.o.F32s[d.idx] = math.Float32frombits(intconv.Uint32(d.fix[:]))
+				d.idx++
+				d.need = 4
+			}
+			d.step = 0
+			d.state = 0
+			d.next = 17
+			continue
+
+		case 18:
+			if d.step == 0 {
+				if !d.varint(data, &n, false) {
+					return n, nil, nil
+				}
+				if x := uint(d.x); x > uint(ColferListMax) {
+					return n, nil, ColferMax(fmt.Sprintf("colfer: gen.o.f64s length %d exceeds %d elements", x, ColferListMax))
+				}
+				d.o.F64s = make([]float64, int(d.x))
+				d.idx = 0
+				d.need = 8
+				d.step = 1
+			}
+			for d.idx < len(d.o.F64s) {
+				if !d.fixed(data, &n) {
+					return n, nil, nil
+				}
+				d.o.F64s[d.idx] = math.Float64frombits(intconv.Uint64(d.fix[:]))
+				d.idx++
+				d.need = 8
+			}
+			d.step = 0
+			d.state = 0
+			d.next = 18
+			continue
+
+		}
+	}
+}
+
 // DromedaryCase oposes name casings.
 type DromedaryCase struct {
 	PascalCase string `xml:"pascal-case" json:"pascal_case,omitempty"`
@@ -1381,6 +1991,94 @@ func (o *DromedaryCase) UnmarshalBinary(data []byte) error {
 	return err
 }
 
+// DromedaryCaseDecoder decodes DromedaryCase records from a data stream,
+// e.g. a network connection. The zero value is ready to use.
+type DromedaryCaseDecoder struct {
+	colferDecoder
+	o DromedaryCase
+}
+
+// Reset clears the decoder state. The decoder is ready for a new record,
+// also after a failure.
+func (d *DromedaryCaseDecoder) Reset() {
+	*d = DromedaryCaseDecoder{}
+}
+
+// Feed consumes bytes from data and returns the number of bytes read.
+// The object return is nil until a record completes. Any bytes beyond the
+// end of the record are left for the next Feed invocation.
+// The error return options are ColferError and ColferMax. The decoder keeps
+// a failure state after an error until Reset.
+func (d *DromedaryCaseDecoder) Feed(data []byte) (int, *DromedaryCase, error) {
+	if d.err != nil {
+		return 0, nil, d.err
+	}
+	n, obj, err := d.feed(data)
+	d.total += n
+	if err != nil {
+		d.err = err
+		return n, nil, err
+	}
+	if d.total+d.need >= ColferSizeMax {
+		d.err = ColferMax(fmt.Sprintf("colfer: struct gen.dromedaryCase size exceeds %d bytes", ColferSizeMax))
+		return n, nil, d.err
+	}
+	if obj != nil {
+		d.total = 0
+	}
+	return n, obj, nil
+}
+
+func (d *DromedaryCaseDecoder) feed(data []byte) (int, *DromedaryCase, error) {
+	var n int
+	for {
+		switch d.state {
+		case 0:
+			if n >= len(data) {
+				return n, nil, nil
+			}
+			d.hdr = data[n]
+			n++
+
+			if d.hdr == 0 && d.next <= 0 {
+				d.state = 1
+				continue
+			}
+
+			if d.hdr != 0x7f {
+				return n, nil, ColferError(d.total + n - 1)
+			}
+			obj := new(DromedaryCase)
+			*obj = d.o
+			d.o = DromedaryCase{}
+			d.next = 0
+			return n, obj, nil
+
+		case 1:
+			if d.step == 0 {
+				if !d.varint(data, &n, false) {
+					return n, nil, nil
+				}
+				if x := uint(d.x); x > uint(ColferSizeMax) {
+					return n, nil, ColferMax(fmt.Sprintf("colfer: gen.dromedaryCase.PascalCase size %d exceeds %d bytes", x, ColferSizeMax))
+				}
+				d.need = int(d.x)
+				d.buf = make([]byte, 0, d.need)
+				d.step = 1
+			}
+			if !d.content(data, &n) {
+				return n, nil, nil
+			}
+			d.o.PascalCase = string(d.buf)
+			d.step = 0
+			d.state = 0
+			d.next = 1
+			continue
+
+		}
+	}
+}
+
 // EmbedO has an inner object only.
 // Covers regression of issue #66.
 type EmbedO struct {
@@ -1482,4 +2180,89 @@ func (o *EmbedO) UnmarshalBinary(data []byte) error {
 		return ColferTail(i)
 	}
 	return err
+}
+
+// EmbedODecoder decodes EmbedO records from a data stream,
+// e.g. a network connection. The zero value is ready to use.
+type EmbedODecoder struct {
+	colferDecoder
+	o        EmbedO
+	subInner *ODecoder
+}
+
+// Reset clears the decoder state. The decoder is ready for a new record,
+// also after a failure.
+func (d *EmbedODecoder) Reset() {
+	*d = EmbedODecoder{}
+}
+
+// Feed consumes bytes from data and returns the number of bytes read.
+// The object return is nil until a record completes. Any bytes beyond the
+// end of the record are left for the next Feed invocation.
+// The error return options are ColferError and ColferMax. The decoder keeps
+// a failure state after an error until Reset.
+func (d *EmbedODecoder) Feed(data []byte) (int, *EmbedO, error) {
+	if d.err != nil {
+		return 0, nil, d.err
+	}
+	n, obj, err := d.feed(data)
+	d.total += n
+	if err != nil {
+		d.err = err
+		return n, nil, err
+	}
+	if d.total+d.need >= ColferSizeMax {
+		d.err = ColferMax(fmt.Sprintf("colfer: struct gen.EmbedO size exceeds %d bytes", ColferSizeMax))
+		return n, nil, d.err
+	}
+	if obj != nil {
+		d.total = 0
+	}
+	return n, obj, nil
+}
+
+func (d *EmbedODecoder) feed(data []byte) (int, *EmbedO, error) {
+	var n int
+	for {
+		switch d.state {
+		case 0:
+			if n >= len(data) {
+				return n, nil, nil
+			}
+			d.hdr = data[n]
+			n++
+
+			if d.hdr == 0 && d.next <= 0 {
+				d.state = 1
+				continue
+			}
+
+			if d.hdr != 0x7f {
+				return n, nil, ColferError(d.total + n - 1)
+			}
+			obj := new(EmbedO)
+			*obj = d.o
+			d.o = EmbedO{}
+			d.next = 0
+			return n, obj, nil
+
+		case 1:
+			if d.subInner == nil {
+				d.subInner = new(ODecoder)
+			}
+			sn, so, serr := d.subInner.Feed(data[n:])
+			n += sn
+			if serr != nil {
+				return n, nil, serr
+			}
+			if so == nil {
+				return n, nil, nil
+			}
+			d.o.Inner = so
+			d.state = 0
+			d.next = 1
+			continue
+
+		}
+	}
 }

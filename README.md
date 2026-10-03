@@ -222,6 +222,33 @@ The following table shows how Colfer data types are applied per language.
 Lists may contain floating points, text, binaries or data structures.
 
 
+## Streaming
+
+The Go generator also emits an incremental decoder per data structure, named
+after the struct, e.g. `CourseDecoder` for `Course`. The decoder accepts
+arbitrary byte fragments, e.g. from a network connection, and returns each
+record once complete.
+
+```go
+var d demo.CourseDecoder
+for {
+	n, course, err := d.Feed(fragment)
+	fragment = fragment[n:]
+	switch {
+	case err != nil:
+		// ColferError or ColferMax; d.Reset() to continue
+	case course != nil:
+		// handle record
+	}
+}
+```
+
+`Feed` returns the number of bytes consumed and a nil object until a record
+completes. Bytes beyond the end of a record are left for the next `Feed`
+invocation. `Close` signals the end of input and reports `io.ErrUnexpectedEOF`
+on a truncated record. After any error the decoder needs a `Reset` before it
+accepts new records.
+
 
 ## Security
 

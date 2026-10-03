@@ -183,12 +183,16 @@ func goMod(dir string) (modDir, modPkg string, err error) {
 
 // GenerateGo writes the code into file "Colfer.go".
 func GenerateGo(basedir string, packages Packages) error {
-	t := template.New("go-code")
+	t := template.New("go-code").Funcs(template.FuncMap{
+		"add": func(a, b int) int { return a + b },
+	})
 	template.Must(t.Parse(goCode))
 	template.Must(t.New("marshal-field").Parse(goMarshalField))
 	template.Must(t.New("marshal-field-len").Parse(goMarshalFieldLen))
 	template.Must(t.New("unmarshal-field").Parse(goUnmarshalField))
 	template.Must(t.New("unmarshal-varint").Parse(goUnmarshalVarint))
+	template.Must(t.New("decode-dispatch").Parse(goDecodeDispatch))
+	template.Must(t.New("decode-field").Parse(goDecodeField))
 
 	modDir, modPkg, err := goMod(basedir)
 	if err != nil {
@@ -267,6 +271,12 @@ var goUnmarshalField string
 
 //go:embed template/go-unmarshal-varint.txt
 var goUnmarshalVarint string
+
+//go:embed template/go-decode-dispatch.txt
+var goDecodeDispatch string
+
+//go:embed template/go-decode-field.txt
+var goDecodeField string
 
 // JavaKeywords are the reserved tokens for Java code.
 // Some entries are redundant due to the use of a Go parser.

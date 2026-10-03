@@ -52,6 +52,100 @@ type ColferTail int
 func (i ColferTail) Error() string {
 	return fmt.Sprintf("colfer: data continuation at byte %d", i)
 }
+
+// A colferDecoder holds the resumable state for incremental decoding.
+// The struct decoders of the package each embed one instance.
+type colferDecoder struct {
+	state int
+	next  int
+	step  int
+	hdr   byte
+	x     uint64
+	sh    uint
+	need  int
+	have  int
+	fix   [12]byte
+	buf   []byte
+	idx   int
+	total int
+	err   error
+}
+
+// Varint consumes variable-length integer bytes from data and returns
+// whether the value is complete. The accumulated value is in d.x.
+func (d *colferDecoder) varint(data []byte, n *int, cap56 bool) bool {
+	if d.sh == 0 {
+		if *n >= len(data) {
+			return false
+		}
+		b := data[*n]
+		*n++
+		if b < 0x80 {
+			d.x = uint64(b)
+			return true
+		}
+		d.x = uint64(b & 0x7f)
+		d.sh = 7
+	}
+	for {
+		if *n >= len(data) {
+			return false
+		}
+		b := uint64(data[*n])
+		*n++
+		if b < 0x80 || (cap56 && d.sh == 56) {
+			d.x |= b << d.sh
+			d.sh = 0
+			return true
+		}
+		d.x |= (b & 0x7f) << d.sh
+		d.sh += 7
+	}
+}
+
+// Fixed consumes d.need bytes from data into d.fix and returns whether the
+// segment is complete.
+func (d *colferDecoder) fixed(data []byte, n *int) bool {
+	take := d.need
+	if r := len(data) - *n; take > r {
+		take = r
+	}
+	copy(d.fix[d.have:], data[*n:*n+take])
+	d.have += take
+	d.need -= take
+	*n += take
+	if d.need != 0 {
+		return false
+	}
+	d.have = 0
+	return true
+}
+
+// Content consumes d.need bytes from data into d.buf and returns whether the
+// segment is complete.
+func (d *colferDecoder) content(data []byte, n *int) bool {
+	take := d.need
+	if r := len(data) - *n; take > r {
+		take = r
+	}
+	d.buf = append(d.buf, data[*n:*n+take]...)
+	d.need -= take
+	*n += take
+	return d.need == 0
+}
+
+// Close signals the end of input. The return is io.ErrUnexpectedEOF when a
+// record is incomplete, or the sticky error when the decoder failed before.
+func (d *colferDecoder) Close() error {
+	if d.err != nil {
+		return d.err
+	}
+	if d.state != 0 || d.next != 0 {
+		d.err = io.ErrUnexpectedEOF
+		return d.err
+	}
+	return nil
+}
 {{range .Structs}}
 {{.DocText "// "}}
 type {{.NameNative}} struct {
@@ -128,5 +222,70 @@ func (o *{{.NameNative}}) UnmarshalBinary(data []byte) error {
 		return ColferTail(i)
 	}
 	return err
+}
+
+// {{.NameNative}}Decoder decodes {{.NameNative}} records from a data stream,
+// e.g. a network connection. The zero value is ready to use.
+type {{.NameNative}}Decoder struct {
+	colferDecoder
+	o {{.NameNative}}
+{{- range .Fields}}{{if .TypeRef}}
+	sub{{.NameNative}} *{{.TypeNative}}Decoder
+{{- end}}{{end}}
+}
+
+// Reset clears the decoder state. The decoder is ready for a new record,
+// also after a failure.
+func (d *{{.NameNative}}Decoder) Reset() {
+	*d = {{.NameNative}}Decoder{}
+}
+
+// Feed consumes bytes from data and returns the number of bytes read.
+// The object return is nil until a record completes. Any bytes beyond the
+// end of the record are left for the next Feed invocation.
+// The error return options are ColferError and ColferMax. The decoder keeps
+// a failure state after an error until Reset.
+func (d *{{.NameNative}}Decoder) Feed(data []byte) (int, *{{.NameNative}}, error) {
+	if d.err != nil {
+		return 0, nil, d.err
+	}
+	n, obj, err := d.feed(data)
+	d.total += n
+	if err != nil {
+		d.err = err
+		return n, nil, err
+	}
+	if d.total+d.need >= ColferSizeMax {
+		d.err = ColferMax(fmt.Sprintf("colfer: struct {{.String}} size exceeds %d bytes", ColferSizeMax))
+		return n, nil, d.err
+	}
+	if obj != nil {
+		d.total = 0
+	}
+	return n, obj, nil
+}
+
+func (d *{{.NameNative}}Decoder) feed(data []byte) (int, *{{.NameNative}}, error) {
+	var n int
+	for {
+		switch d.state {
+		case 0:
+			if n >= len(data) {
+				return n, nil, nil
+			}
+			d.hdr = data[n]
+			n++
+{{range .Fields}}{{template "decode-dispatch" .}}{{end}}
+			if d.hdr != 0x7f {
+				return n, nil, ColferError(d.total + n - 1)
+			}
+			obj := new({{.NameNative}})
+			*obj = d.o
+			d.o = {{.NameNative}}{}
+			d.next = 0
+			return n, obj, nil
+{{range .Fields}}{{template "decode-field" .}}{{end}}
+		}
+	}
 }
 {{end}}

@@ -120,6 +120,208 @@ func TestUnmarshal(t *testing.T) {
 	}
 }
 
+// equalO compares o with want, with a work around for NaN != NaN.
+func equalO(o, want *O) bool {
+	a, b := *o, *want
+	if math.IsNaN(float64(a.F32)) && math.IsNaN(float64(b.F32)) {
+		a.F32, b.F32 = 0, 0
+	}
+	if math.IsNaN(a.F64) && math.IsNaN(b.F64) {
+		a.F64, b.F64 = 0, 0
+	}
+	return reflect.DeepEqual(a, b)
+}
+
+func TestDecoderSplits(t *testing.T) {
+	for _, gold := range newGoldenCases() {
+		data, err := hex.DecodeString(gold.serial)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// the one-shot decoder as a reference
+		var ref O
+		if _, err := ref.Unmarshal(data); err != nil {
+			t.Fatalf("0x%s: reference decode: %s", gold.serial, err)
+		}
+
+		// split the record at every byte position
+		for i := 0; i <= len(data); i++ {
+			d := new(ODecoder)
+			n, obj, err := d.Feed(data[:i])
+			if err != nil {
+				t.Errorf("0x%s: split %d: first feed: %s", gold.serial, i, err)
+				continue
+			}
+			if n != i {
+				t.Errorf("0x%s: split %d: first feed consumed %d bytes", gold.serial, i, n)
+			}
+			if i < len(data) && obj != nil {
+				t.Errorf("0x%s: split %d: incomplete record delivered", gold.serial, i)
+			}
+			if obj == nil {
+				var n2 int
+				n2, obj, err = d.Feed(data[i:])
+				if err != nil {
+					t.Errorf("0x%s: split %d: second feed: %s", gold.serial, i, err)
+					continue
+				}
+				if n2 != len(data)-i {
+					t.Errorf("0x%s: split %d: second feed consumed %d bytes", gold.serial, i, n2)
+				}
+			}
+			if obj == nil {
+				t.Errorf("0x%s: split %d: no record delivered", gold.serial, i)
+				continue
+			}
+			if !equalO(obj, &ref) {
+				t.Errorf("0x%s: split %d: got %+v, want %+v", gold.serial, i, obj, &ref)
+			}
+		}
+
+		// feed one byte at a time
+		d := new(ODecoder)
+		var obj *O
+		for i := range data {
+			n, o, err := d.Feed(data[i : i+1])
+			if err != nil {
+				t.Errorf("0x%s: byte %d: %s", gold.serial, i, err)
+				break
+			}
+			if n != 1 {
+				t.Errorf("0x%s: byte %d: consumed %d bytes", gold.serial, i, n)
+			}
+			if o != nil {
+				obj = o
+			}
+		}
+		if obj == nil {
+			t.Errorf("0x%s: byte feed: no record delivered", gold.serial)
+		} else if !equalO(obj, &ref) {
+			t.Errorf("0x%s: byte feed: got %+v, want %+v", gold.serial, obj, &ref)
+		}
+	}
+}
+
+func TestDecoderStream(t *testing.T) {
+	var stream []byte
+	var wants []O
+	for _, gold := range newGoldenCases() {
+		data, err := hex.DecodeString(gold.serial)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stream = append(stream, data...)
+		wants = append(wants, gold.object)
+	}
+
+	d := new(ODecoder)
+	for i, want := range wants {
+		n, obj, err := d.Feed(stream)
+		if err != nil {
+			t.Fatalf("record %d: %s", i, err)
+		}
+		if obj == nil {
+			t.Fatalf("record %d: no record delivered", i)
+		}
+		if !equalO(obj, &want) {
+			t.Errorf("record %d: got %+v, want %+v", i, obj, &want)
+		}
+		stream = stream[n:]
+	}
+	if len(stream) != 0 {
+		t.Errorf("%d bytes left after %d records", len(stream), len(wants))
+	}
+	if err := d.Close(); err != nil {
+		t.Errorf("close on record boundary: %s", err)
+	}
+}
+
+func TestDecoderError(t *testing.T) {
+	// duplicate field header is an illegal sequence
+	data, err := hex.DecodeString("00007f")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := new(ODecoder)
+	if _, _, err := d.Feed(data); err != ColferError(1) {
+		t.Fatalf("got error %v, want ColferError(1)", err)
+	}
+	// the failure is sticky
+	if _, _, err := d.Feed(data); err != ColferError(1) {
+		t.Fatalf("got error %v after failure, want ColferError(1)", err)
+	}
+	// Reset recovers
+	d.Reset()
+	n, obj, err := d.Feed(data[2:])
+	if err != nil {
+		t.Fatalf("got error %s after Reset", err)
+	}
+	if n != 1 || obj == nil {
+		t.Fatalf("got %d bytes and object %v after Reset", n, obj)
+	}
+}
+
+func TestDecoderSizeMax(t *testing.T) {
+	orig := ColferSizeMax
+	defer func() {
+		ColferSizeMax = orig
+	}()
+
+	data, err := hex.DecodeString("0801417f")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ColferSizeMax = 4
+	d := new(ODecoder)
+	if _, _, err := d.Feed(data); err != nil {
+		if _, ok := err.(ColferMax); !ok {
+			t.Fatalf("got error %T: %q, want ColferMax", err, err)
+		}
+	} else {
+		t.Fatal("no error for record at ColferSizeMax")
+	}
+
+	// length prefix beyond the limit
+	ColferSizeMax = orig
+	d.Reset()
+	big := []byte{8, 0xff, 0xff, 0xff, 0xff, 0x7f}
+	if _, _, err := d.Feed(big); err != nil {
+		if _, ok := err.(ColferMax); !ok {
+			t.Fatalf("got error %T: %q, want ColferMax", err, err)
+		}
+	} else {
+		t.Fatal("no error for length prefix beyond ColferSizeMax")
+	}
+}
+
+func TestDecoderTruncation(t *testing.T) {
+	data, err := hex.DecodeString("08026100")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := new(ODecoder)
+	n, obj, err := d.Feed(data)
+	if err != nil || obj != nil {
+		t.Fatalf("got %d, %v, %s for an incomplete record", n, obj, err)
+	}
+	if err := d.Close(); err != io.ErrUnexpectedEOF {
+		t.Fatalf("got close error %v, want io.ErrUnexpectedEOF", err)
+	}
+	// the failure is sticky
+	if _, _, err := d.Feed(data); err != io.ErrUnexpectedEOF {
+		t.Fatalf("got error %v after close, want io.ErrUnexpectedEOF", err)
+	}
+	// Reset recovers
+	d.Reset()
+	if _, obj, err := d.Feed(append(data, 0x7f)); err != nil || obj == nil {
+		t.Fatalf("got %v, %s after Reset", obj, err)
+	}
+}
+
 func TestUnmarshalEOF(t *testing.T) {
 	for _, gold := range newGoldenCases() {
 		data, err := hex.DecodeString(gold.serial)
