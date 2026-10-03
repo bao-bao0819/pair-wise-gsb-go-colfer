@@ -52,6 +52,7 @@ type ColferTail int
 func (i ColferTail) Error() string {
 	return fmt.Sprintf("colfer: data continuation at byte %d", i)
 }
+{{template "decoder-engine" .}}
 {{range .Structs}}
 {{.DocText "// "}}
 type {{.NameNative}} struct {
@@ -129,4 +130,5 @@ func (o *{{.NameNative}}) UnmarshalBinary(data []byte) error {
 	}
 	return err
 }
+{{template "decoder-struct" .}}
 {{end}}

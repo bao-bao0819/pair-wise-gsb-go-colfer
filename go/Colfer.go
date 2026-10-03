@@ -44,6 +44,476 @@ func (i ColferTail) Error() string {
 	return fmt.Sprintf("colfer: data continuation at byte %d", i)
 }
 
+// Colfer decode op kinds for the incremental decoder.
+const (
+	colferDecBool = iota
+	colferDecUint8
+	colferDecUint16
+	colferDecUint32
+	colferDecUint64
+	colferDecInt32
+	colferDecInt64
+	colferDecFloat32
+	colferDecFloat64
+	colferDecTimestamp
+	colferDecText
+	colferDecBinary
+	colferDecObject
+	colferDecList
+)
+
+// colferDecWideOk returns whether the op kind has a header|0x80 variant.
+func colferDecWideOk(kind int) bool {
+	switch kind {
+	case colferDecUint16, colferDecUint32, colferDecUint64, colferDecInt32, colferDecInt64, colferDecTimestamp:
+		return true
+	}
+	return false
+}
+
+// colferDecOp describes the decode of one field.
+type colferDecOp struct {
+	kind int    // payload encoding
+	elem int    // element payload encoding for colferDecList
+	name string // qualified field name for error reports
+}
+
+// colferDecSpec describes the decode of one struct.
+type colferDecSpec struct {
+	name string // qualified struct name for error reports
+	ops  []colferDecOp
+}
+
+// colferValue holds a decoded field value.
+type colferValue struct {
+	u    uint64
+	u2   uint64
+	s    string
+	b    []byte
+	obj  interface{}
+	i32s []int32
+	i64s []int64
+	f32s []float32
+	f64s []float64
+	strs []string
+	bss  [][]byte
+	objs []interface{}
+}
+
+// colferStreamHooks connects the decode engine to a generated decoder.
+type colferStreamHooks interface {
+	assign(field int, v *colferValue)
+	feedChild(field int, data []byte) (n int, obj interface{}, err error)
+}
+
+// colferStream is an incremental decode engine. Each input byte is consumed
+// at most once; all progress survives fragment boundaries.
+type colferStream struct {
+	err   error // sticky failure, cleared by reset only
+	total int   // bytes consumed by the record in progress
+
+	op     int  // field index + 1 in decode, 0 when expecting a header
+	wide   bool // header of the field in decode had the 0x80 bit set
+	minIdx int  // lowest field index accepted next
+
+	x     uint64 // varint accumulator
+	shift uint   // varint shift, 0 when no bytes were read yet
+
+	fix  [12]byte // fixed-size number accumulator
+	have int      // bytes accumulated in fix or content
+	need int      // bytes wanted in fix or content
+
+	phase   int    // sub-state within a field
+	content []byte // text and binary accumulator
+
+	count int // list elements to go
+	idx   int // list element index
+
+	value colferValue // field value in assembly
+}
+
+// reset clears all state, including any error.
+func (s *colferStream) reset() {
+	content := s.content[:0]
+	*s = colferStream{content: content}
+}
+
+// feed consumes a fragment and reports whether a record completed. Once an
+// error occurs all following calls return the same error until reset.
+func (s *colferStream) feed(data []byte, spec *colferDecSpec, hooks colferStreamHooks) (int, bool, error) {
+	if s.err != nil {
+		return 0, false, s.err
+	}
+	n, done, err := s.run(data, spec, hooks)
+	s.total += n
+	if err != nil {
+		s.err = err
+		return n, false, err
+	}
+	if s.total >= ColferSizeMax {
+		s.err = ColferMax(fmt.Sprintf("colfer: struct %s size exceeds %d bytes", spec.name, ColferSizeMax))
+		return n, false, s.err
+	}
+	if done {
+		s.reset()
+	}
+	return n, done, nil
+}
+
+// fieldDone stores the assembled value and returns to the header state.
+func (s *colferStream) fieldDone(hooks colferStreamHooks) {
+	hooks.assign(s.op-1, &s.value)
+	s.minIdx = s.op
+	s.op = 0
+}
+
+// varint accumulates a variable-length integer into s.x and reports
+// completion. Cap56 applies the 10-byte limit used by 64-bit integers.
+func (s *colferStream) varint(data []byte, i int, cap56 bool) (int, bool) {
+	for i < len(data) {
+		b := data[i]
+		i++
+		if s.shift == 0 {
+			s.x = uint64(b)
+			if b < 0x80 {
+				return i, true
+			}
+			s.x &= 0x7f
+			s.shift = 7
+			continue
+		}
+		if b < 0x80 || (cap56 && s.shift == 56) {
+			s.x |= uint64(b) << s.shift
+			s.shift = 0
+			return i, true
+		}
+		s.x |= uint64(b&0x7f) << s.shift
+		s.shift += 7
+	}
+	return i, false
+}
+
+// fixed accumulates n bytes into s.fix and reports completion.
+func (s *colferStream) fixed(data []byte, i, n int) (int, bool) {
+	for s.have < n && i < len(data) {
+		s.fix[s.have] = data[i]
+		s.have++
+		i++
+	}
+	if s.have != n {
+		return i, false
+	}
+	s.have = 0
+	return i, true
+}
+
+// fill accumulates s.need bytes into s.content and reports completion.
+func (s *colferStream) fill(data []byte, i int) (int, bool) {
+	n := s.need - s.have
+	if r := len(data) - i; r < n {
+		n = r
+	}
+	s.content = append(s.content, data[i:i+n]...)
+	s.have += n
+	i += n
+	if s.have != s.need {
+		return i, false
+	}
+	s.have = 0
+	return i, true
+}
+
+// run consumes data and reports whether a record completed.
+func (s *colferStream) run(data []byte, spec *colferDecSpec, hooks colferStreamHooks) (int, bool, error) {
+	i := 0
+	for {
+		if s.op == 0 {
+			if i >= len(data) {
+				return i, false, nil
+			}
+			h := data[i]
+			if h == 0x7f {
+				i++
+				return i, true, nil
+			}
+			idx := int(h & 0x7f)
+			if idx < s.minIdx || idx >= len(spec.ops) {
+				return i, false, ColferError(s.total + i)
+			}
+			op := &spec.ops[idx]
+			wide := h >= 0x80
+			if wide && !colferDecWideOk(op.kind) {
+				return i, false, ColferError(s.total + i)
+			}
+			i++
+			s.op = idx + 1
+			s.wide = wide
+			s.x, s.shift = 0, 0
+			s.have, s.need, s.phase = 0, 0, 0
+			s.count, s.idx = 0, 0
+			s.content = s.content[:0]
+			s.value = colferValue{}
+			continue
+		}
+
+		op := &spec.ops[s.op-1]
+		var ok bool
+		switch op.kind {
+		case colferDecBool:
+			s.fieldDone(hooks)
+
+		case colferDecUint8:
+			if i >= len(data) {
+				return i, false, nil
+			}
+			s.value.u = uint64(data[i])
+			i++
+			s.fieldDone(hooks)
+
+		case colferDecUint16:
+			need := 2
+			if s.wide {
+				need = 1
+			}
+			if i, ok = s.fixed(data, i, need); !ok {
+				return i, false, nil
+			}
+			if s.wide {
+				s.value.u = uint64(s.fix[0])
+			} else {
+				s.value.u = uint64(intconv.Uint16(s.fix[:]))
+			}
+			s.fieldDone(hooks)
+
+		case colferDecUint32:
+			if s.wide {
+				if i, ok = s.fixed(data, i, 4); !ok {
+					return i, false, nil
+				}
+				s.value.u = uint64(intconv.Uint32(s.fix[:]))
+			} else {
+				if i, ok = s.varint(data, i, false); !ok {
+					return i, false, nil
+				}
+				s.value.u = s.x
+			}
+			s.fieldDone(hooks)
+
+		case colferDecUint64:
+			if s.wide {
+				if i, ok = s.fixed(data, i, 8); !ok {
+					return i, false, nil
+				}
+				s.value.u = intconv.Uint64(s.fix[:])
+			} else {
+				if i, ok = s.varint(data, i, true); !ok {
+					return i, false, nil
+				}
+				s.value.u = s.x
+			}
+			s.fieldDone(hooks)
+
+		case colferDecInt32:
+			if i, ok = s.varint(data, i, false); !ok {
+				return i, false, nil
+			}
+			s.value.u = s.x
+			if s.wide {
+				s.value.u = ^s.value.u + 1
+			}
+			s.fieldDone(hooks)
+
+		case colferDecInt64:
+			if i, ok = s.varint(data, i, true); !ok {
+				return i, false, nil
+			}
+			s.value.u = s.x
+			if s.wide {
+				s.value.u = ^s.value.u + 1
+			}
+			s.fieldDone(hooks)
+
+		case colferDecFloat32:
+			if i, ok = s.fixed(data, i, 4); !ok {
+				return i, false, nil
+			}
+			s.value.u = uint64(intconv.Uint32(s.fix[:]))
+			s.fieldDone(hooks)
+
+		case colferDecFloat64:
+			if i, ok = s.fixed(data, i, 8); !ok {
+				return i, false, nil
+			}
+			s.value.u = intconv.Uint64(s.fix[:])
+			s.fieldDone(hooks)
+
+		case colferDecTimestamp:
+			need := 8
+			if s.wide {
+				need = 12
+			}
+			if i, ok = s.fixed(data, i, need); !ok {
+				return i, false, nil
+			}
+			if s.wide {
+				s.value.u = intconv.Uint64(s.fix[:])
+				s.value.u2 = uint64(intconv.Uint32(s.fix[8:]))
+			} else {
+				s.value.u = uint64(intconv.Uint32(s.fix[:]))
+				s.value.u2 = uint64(intconv.Uint32(s.fix[4:]))
+			}
+			s.fieldDone(hooks)
+
+		case colferDecText:
+			if s.phase == 0 {
+				if i, ok = s.varint(data, i, false); !ok {
+					return i, false, nil
+				}
+				if s.x > uint64(ColferSizeMax) {
+					return i, false, ColferMax(fmt.Sprintf("colfer: %s size %d exceeds %d bytes", op.name, s.x, ColferSizeMax))
+				}
+				s.need = int(s.x)
+				s.phase = 1
+			}
+			if i, ok = s.fill(data, i); !ok {
+				return i, false, nil
+			}
+			s.value.s = string(s.content)
+			s.fieldDone(hooks)
+
+		case colferDecBinary:
+			if s.phase == 0 {
+				if i, ok = s.varint(data, i, false); !ok {
+					return i, false, nil
+				}
+				if s.x > uint64(ColferSizeMax) {
+					return i, false, ColferMax(fmt.Sprintf("colfer: %s size %d exceeds %d bytes", op.name, s.x, ColferSizeMax))
+				}
+				s.need = int(s.x)
+				s.phase = 1
+			}
+			if i, ok = s.fill(data, i); !ok {
+				return i, false, nil
+			}
+			s.value.b = s.content
+			if s.value.b == nil {
+				s.value.b = []byte{}
+			}
+			s.content = nil
+			s.fieldDone(hooks)
+
+		case colferDecObject:
+			m, obj, err := hooks.feedChild(s.op-1, data[i:])
+			i += m
+			if err != nil {
+				return i, false, err
+			}
+			if obj == nil {
+				return i, false, nil
+			}
+			s.value.obj = obj
+			s.fieldDone(hooks)
+
+		case colferDecList:
+			if s.phase == 0 {
+				if i, ok = s.varint(data, i, false); !ok {
+					return i, false, nil
+				}
+				if s.x > uint64(ColferListMax) {
+					return i, false, ColferMax(fmt.Sprintf("colfer: %s length %d exceeds %d elements", op.name, s.x, ColferListMax))
+				}
+				s.count = int(s.x)
+				s.phase = 1
+				switch op.elem {
+				case colferDecInt32:
+					s.value.i32s = make([]int32, 0, s.count)
+				case colferDecInt64:
+					s.value.i64s = make([]int64, 0, s.count)
+				case colferDecFloat32:
+					s.value.f32s = make([]float32, 0, s.count)
+				case colferDecFloat64:
+					s.value.f64s = make([]float64, 0, s.count)
+				case colferDecText:
+					s.value.strs = make([]string, 0, s.count)
+				case colferDecBinary:
+					s.value.bss = make([][]byte, 0, s.count)
+				case colferDecObject:
+					s.value.objs = make([]interface{}, 0, s.count)
+				}
+				if s.count == 0 {
+					s.fieldDone(hooks)
+					continue
+				}
+			}
+			for s.count > 0 {
+				switch op.elem {
+				case colferDecInt32:
+					if i, ok = s.varint(data, i, false); !ok {
+						return i, false, nil
+					}
+					x := s.x
+					s.value.i32s = append(s.value.i32s, int32((x>>1)^-(x&1)))
+				case colferDecInt64:
+					if i, ok = s.varint(data, i, true); !ok {
+						return i, false, nil
+					}
+					x := s.x
+					s.value.i64s = append(s.value.i64s, int64((x>>1)^-(x&1)))
+				case colferDecFloat32:
+					if i, ok = s.fixed(data, i, 4); !ok {
+						return i, false, nil
+					}
+					s.value.f32s = append(s.value.f32s, math.Float32frombits(intconv.Uint32(s.fix[:])))
+				case colferDecFloat64:
+					if i, ok = s.fixed(data, i, 8); !ok {
+						return i, false, nil
+					}
+					s.value.f64s = append(s.value.f64s, math.Float64frombits(intconv.Uint64(s.fix[:])))
+				case colferDecText, colferDecBinary:
+					if s.phase == 1 {
+						if i, ok = s.varint(data, i, false); !ok {
+							return i, false, nil
+						}
+						if s.x > uint64(ColferSizeMax) {
+							return i, false, ColferMax(fmt.Sprintf("colfer: %s element %d size %d exceeds %d bytes", op.name, s.idx, s.x, ColferSizeMax))
+						}
+						s.need = int(s.x)
+						s.phase = 2
+					}
+					if i, ok = s.fill(data, i); !ok {
+						return i, false, nil
+					}
+					if op.elem == colferDecText {
+						s.value.strs = append(s.value.strs, string(s.content))
+						s.content = s.content[:0]
+					} else {
+						b := s.content
+						if b == nil {
+							b = []byte{}
+						}
+						s.value.bss = append(s.value.bss, b)
+						s.content = nil
+					}
+					s.phase = 1
+				case colferDecObject:
+					m, obj, err := hooks.feedChild(s.op-1, data[i:])
+					i += m
+					if err != nil {
+						return i, false, err
+					}
+					if obj == nil {
+						return i, false, nil
+					}
+					s.value.objs = append(s.value.objs, obj)
+				}
+				s.count--
+				s.idx++
+			}
+			s.fieldDone(hooks)
+		}
+	}
+}
+
 // O contains all supported data types.
 type O struct {
 	// B tests booleans.
@@ -1249,6 +1719,153 @@ func (o *O) UnmarshalBinary(data []byte) error {
 	return err
 }
 
+// ODecoder decodes a stream of O records, one
+// fragment at a time, as typically received from a network connection.
+// The zero value is ready to use.
+type ODecoder struct {
+	stream  colferStream
+	obj     O
+	childO  *ODecoder
+	childOs *ODecoder
+}
+
+// decSpecO describes the O record decode.
+var decSpecO = colferDecSpec{
+	name: "gen.o",
+	ops: []colferDecOp{
+		{kind: colferDecBool, name: "gen.o.b"},
+		{kind: colferDecUint32, name: "gen.o.u32"},
+		{kind: colferDecUint64, name: "gen.o.u64"},
+		{kind: colferDecInt32, name: "gen.o.i32"},
+		{kind: colferDecInt64, name: "gen.o.i64"},
+		{kind: colferDecFloat32, name: "gen.o.f32"},
+		{kind: colferDecFloat64, name: "gen.o.f64"},
+		{kind: colferDecTimestamp, name: "gen.o.t"},
+		{kind: colferDecText, name: "gen.o.s"},
+		{kind: colferDecBinary, name: "gen.o.a"},
+		{kind: colferDecObject, name: "gen.o.o"},
+		{kind: colferDecList, elem: colferDecObject, name: "gen.o.os"},
+		{kind: colferDecList, elem: colferDecText, name: "gen.o.ss"},
+		{kind: colferDecList, elem: colferDecBinary, name: "gen.o.as"},
+		{kind: colferDecUint8, name: "gen.o.u8"},
+		{kind: colferDecUint16, name: "gen.o.u16"},
+		{kind: colferDecList, elem: colferDecFloat32, name: "gen.o.f32s"},
+		{kind: colferDecList, elem: colferDecFloat64, name: "gen.o.f64s"},
+	},
+}
+
+// Feed consumes the next fragment of Colfer data and returns the number of
+// bytes read. The object return is nil until a record completes. Bytes
+// beyond a completed record are left in data for the next call; the decoder
+// is ready for the next record right away. The error return options are
+// ColferError and ColferMax. After an error the decoder rejects all input
+// until Reset.
+func (d *ODecoder) Feed(data []byte) (int, *O, error) {
+	n, done, err := d.stream.feed(data, &decSpecO, d)
+	if !done {
+		return n, nil, err
+	}
+	o := d.obj
+	d.obj = O{}
+	return n, &o, err
+}
+
+// End signals that no more data will follow. The return is
+// io.ErrUnexpectedEOF when a record is still incomplete, any sticky error
+// from Feed otherwise, and nil at a record boundary.
+func (d *ODecoder) End() error {
+	if d.stream.err != nil {
+		return d.stream.err
+	}
+	if d.stream.total != 0 || d.stream.op != 0 {
+		d.stream.err = io.ErrUnexpectedEOF
+	}
+	return d.stream.err
+}
+
+// Reset clears all state, including any error, making the decoder ready for
+// new records.
+func (d *ODecoder) Reset() {
+	d.stream.reset()
+	d.obj = O{}
+	if d.childO != nil {
+		d.childO.Reset()
+	}
+	if d.childOs != nil {
+		d.childOs.Reset()
+	}
+}
+
+// assign honors the colferStreamHooks interface.
+func (d *ODecoder) assign(field int, v *colferValue) {
+	switch field {
+	case 0:
+		d.obj.B = true
+	case 1:
+		d.obj.U32 = uint32(v.u)
+	case 2:
+		d.obj.U64 = uint64(v.u)
+	case 3:
+		d.obj.I32 = int32(v.u)
+	case 4:
+		d.obj.I64 = int64(v.u)
+	case 5:
+		d.obj.F32 = math.Float32frombits(uint32(v.u))
+	case 6:
+		d.obj.F64 = math.Float64frombits(v.u)
+	case 7:
+		d.obj.T = time.Unix(int64(v.u), int64(v.u2)).In(time.UTC)
+	case 8:
+		d.obj.S = v.s
+	case 9:
+		d.obj.A = v.b
+	case 10:
+		d.obj.O = v.obj.(*O)
+	case 11:
+		d.obj.Os = make([]*O, len(v.objs))
+		for k, e := range v.objs {
+			d.obj.Os[k] = e.(*O)
+		}
+	case 12:
+		d.obj.Ss = v.strs
+	case 13:
+		d.obj.As = v.bss
+	case 14:
+		d.obj.U8 = uint8(v.u)
+	case 15:
+		d.obj.U16 = uint16(v.u)
+	case 16:
+		d.obj.F32s = v.f32s
+	case 17:
+		d.obj.F64s = v.f64s
+	}
+}
+
+// feedChild honors the colferStreamHooks interface.
+func (d *ODecoder) feedChild(field int, data []byte) (int, interface{}, error) {
+	switch field {
+	case 10:
+		if d.childO == nil {
+			d.childO = new(ODecoder)
+		}
+		n, o, err := d.childO.Feed(data)
+		if err != nil || o == nil {
+			return n, nil, err
+		}
+		return n, o, nil
+	case 11:
+		if d.childOs == nil {
+			d.childOs = new(ODecoder)
+		}
+		n, o, err := d.childOs.Feed(data)
+		if err != nil || o == nil {
+			return n, nil, err
+		}
+		return n, o, nil
+	}
+	return 0, nil, nil
+}
+
 // DromedaryCase oposes name casings.
 type DromedaryCase struct {
 	PascalCase string `xml:"pascal-case" json:"pascal_case,omitempty"`
@@ -1381,6 +1998,73 @@ func (o *DromedaryCase) UnmarshalBinary(data []byte) error {
 	return err
 }
 
+// DromedaryCaseDecoder decodes a stream of DromedaryCase records, one
+// fragment at a time, as typically received from a network connection.
+// The zero value is ready to use.
+type DromedaryCaseDecoder struct {
+	stream colferStream
+	obj    DromedaryCase
+}
+
+// decSpecDromedaryCase describes the DromedaryCase record decode.
+var decSpecDromedaryCase = colferDecSpec{
+	name: "gen.dromedaryCase",
+	ops: []colferDecOp{
+		{kind: colferDecText, name: "gen.dromedaryCase.PascalCase"},
+	},
+}
+
+// Feed consumes the next fragment of Colfer data and returns the number of
+// bytes read. The object return is nil until a record completes. Bytes
+// beyond a completed record are left in data for the next call; the decoder
+// is ready for the next record right away. The error return options are
+// ColferError and ColferMax. After an error the decoder rejects all input
+// until Reset.
+func (d *DromedaryCaseDecoder) Feed(data []byte) (int, *DromedaryCase, error) {
+	n, done, err := d.stream.feed(data, &decSpecDromedaryCase, d)
+	if !done {
+		return n, nil, err
+	}
+	o := d.obj
+	d.obj = DromedaryCase{}
+	return n, &o, err
+}
+
+// End signals that no more data will follow. The return is
+// io.ErrUnexpectedEOF when a record is still incomplete, any sticky error
+// from Feed otherwise, and nil at a record boundary.
+func (d *DromedaryCaseDecoder) End() error {
+	if d.stream.err != nil {
+		return d.stream.err
+	}
+	if d.stream.total != 0 || d.stream.op != 0 {
+		d.stream.err = io.ErrUnexpectedEOF
+	}
+	return d.stream.err
+}
+
+// Reset clears all state, including any error, making the decoder ready for
+// new records.
+func (d *DromedaryCaseDecoder) Reset() {
+	d.stream.reset()
+	d.obj = DromedaryCase{}
+}
+
+// assign honors the colferStreamHooks interface.
+func (d *DromedaryCaseDecoder) assign(field int, v *colferValue) {
+	switch field {
+	case 0:
+		d.obj.PascalCase = v.s
+	}
+}
+
+// feedChild honors the colferStreamHooks interface.
+func (d *DromedaryCaseDecoder) feedChild(field int, data []byte) (int, interface{}, error) {
+	switch field {
+	}
+	return 0, nil, nil
+}
+
 // EmbedO has an inner object only.
 // Covers regression of issue #66.
 type EmbedO struct {
@@ -1482,4 +2166,84 @@ func (o *EmbedO) UnmarshalBinary(data []byte) error {
 		return ColferTail(i)
 	}
 	return err
+}
+
+// EmbedODecoder decodes a stream of EmbedO records, one
+// fragment at a time, as typically received from a network connection.
+// The zero value is ready to use.
+type EmbedODecoder struct {
+	stream     colferStream
+	obj        EmbedO
+	childInner *ODecoder
+}
+
+// decSpecEmbedO describes the EmbedO record decode.
+var decSpecEmbedO = colferDecSpec{
+	name: "gen.EmbedO",
+	ops: []colferDecOp{
+		{kind: colferDecObject, name: "gen.EmbedO.inner"},
+	},
+}
+
+// Feed consumes the next fragment of Colfer data and returns the number of
+// bytes read. The object return is nil until a record completes. Bytes
+// beyond a completed record are left in data for the next call; the decoder
+// is ready for the next record right away. The error return options are
+// ColferError and ColferMax. After an error the decoder rejects all input
+// until Reset.
+func (d *EmbedODecoder) Feed(data []byte) (int, *EmbedO, error) {
+	n, done, err := d.stream.feed(data, &decSpecEmbedO, d)
+	if !done {
+		return n, nil, err
+	}
+	o := d.obj
+	d.obj = EmbedO{}
+	return n, &o, err
+}
+
+// End signals that no more data will follow. The return is
+// io.ErrUnexpectedEOF when a record is still incomplete, any sticky error
+// from Feed otherwise, and nil at a record boundary.
+func (d *EmbedODecoder) End() error {
+	if d.stream.err != nil {
+		return d.stream.err
+	}
+	if d.stream.total != 0 || d.stream.op != 0 {
+		d.stream.err = io.ErrUnexpectedEOF
+	}
+	return d.stream.err
+}
+
+// Reset clears all state, including any error, making the decoder ready for
+// new records.
+func (d *EmbedODecoder) Reset() {
+	d.stream.reset()
+	d.obj = EmbedO{}
+	if d.childInner != nil {
+		d.childInner.Reset()
+	}
+}
+
+// assign honors the colferStreamHooks interface.
+func (d *EmbedODecoder) assign(field int, v *colferValue) {
+	switch field {
+	case 0:
+		d.obj.Inner = v.obj.(*O)
+	}
+}
+
+// feedChild honors the colferStreamHooks interface.
+func (d *EmbedODecoder) feedChild(field int, data []byte) (int, interface{}, error) {
+	switch field {
+	case 0:
+		if d.childInner == nil {
+			d.childInner = new(ODecoder)
+		}
+		n, o, err := d.childInner.Feed(data)
+		if err != nil || o == nil {
+			return n, nil, err
+		}
+		return n, o, nil
+	}
+	return 0, nil, nil
 }

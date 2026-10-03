@@ -1,0 +1,124 @@
+// {{.NameNative}}Decoder decodes a stream of {{.NameNative}} records, one
+// fragment at a time, as typically received from a network connection.
+// The zero value is ready to use.
+type {{.NameNative}}Decoder struct {
+	stream colferStream
+	obj    {{.NameNative}}
+{{- range .Fields}}{{if .TypeRef}}
+	child{{.NameNative}} *{{.TypeNative}}Decoder
+{{- end}}{{end}}
+}
+
+// decSpec{{.NameNative}} describes the {{.NameNative}} record decode.
+var decSpec{{.NameNative}} = colferDecSpec{
+	name: "{{.String}}",
+	ops: []colferDecOp{
+{{- range .Fields}}
+		{kind: {{if .TypeList}}colferDecList, elem: {{decKind .}}{{else}}{{decKind .}}{{end}}, name: "{{.String}}"},
+{{- end}}
+	},
+}
+
+// Feed consumes the next fragment of Colfer data and returns the number of
+// bytes read. The object return is nil until a record completes. Bytes
+// beyond a completed record are left in data for the next call; the decoder
+// is ready for the next record right away. The error return options are
+// ColferError and ColferMax. After an error the decoder rejects all input
+// until Reset.
+func (d *{{.NameNative}}Decoder) Feed(data []byte) (int, *{{.NameNative}}, error) {
+	n, done, err := d.stream.feed(data, &decSpec{{.NameNative}}, d)
+	if !done {
+		return n, nil, err
+	}
+	o := d.obj
+	d.obj = {{.NameNative}}{}
+	return n, &o, err
+}
+
+// End signals that no more data will follow. The return is
+// io.ErrUnexpectedEOF when a record is still incomplete, any sticky error
+// from Feed otherwise, and nil at a record boundary.
+func (d *{{.NameNative}}Decoder) End() error {
+	if d.stream.err != nil {
+		return d.stream.err
+	}
+	if d.stream.total != 0 || d.stream.op != 0 {
+		d.stream.err = io.ErrUnexpectedEOF
+	}
+	return d.stream.err
+}
+
+// Reset clears all state, including any error, making the decoder ready for
+// new records.
+func (d *{{.NameNative}}Decoder) Reset() {
+	d.stream.reset()
+	d.obj = {{.NameNative}}{}
+{{- range .Fields}}{{if .TypeRef}}
+	if d.child{{.NameNative}} != nil {
+		d.child{{.NameNative}}.Reset()
+	}
+{{- end}}{{end}}
+}
+
+// assign honors the colferStreamHooks interface.
+func (d *{{.NameNative}}Decoder) assign(field int, v *colferValue) {
+	switch field {
+{{- range .Fields}}
+	case {{.Index}}:
+{{- if .TypeList}}
+{{- if eq .Type "int32"}}
+		d.obj.{{.NameNative}} = v.i32s
+{{- else if eq .Type "int64"}}
+		d.obj.{{.NameNative}} = v.i64s
+{{- else if eq .Type "float32"}}
+		d.obj.{{.NameNative}} = v.f32s
+{{- else if eq .Type "float64"}}
+		d.obj.{{.NameNative}} = v.f64s
+{{- else if eq .Type "text"}}
+		d.obj.{{.NameNative}} = v.strs
+{{- else if eq .Type "binary"}}
+		d.obj.{{.NameNative}} = v.bss
+{{- else}}
+		d.obj.{{.NameNative}} = make([]*{{.TypeNative}}, len(v.objs))
+		for k, e := range v.objs {
+			d.obj.{{.NameNative}}[k] = e.(*{{.TypeNative}})
+		}
+{{- end}}
+{{- else if eq .Type "bool"}}
+		d.obj.{{.NameNative}} = true
+{{- else if eq .Type "float32"}}
+		d.obj.{{.NameNative}} = math.Float32frombits(uint32(v.u))
+{{- else if eq .Type "float64"}}
+		d.obj.{{.NameNative}} = math.Float64frombits(v.u)
+{{- else if eq .Type "timestamp"}}
+		d.obj.{{.NameNative}} = time.Unix(int64(v.u), int64(v.u2)).In(time.UTC)
+{{- else if eq .Type "text"}}
+		d.obj.{{.NameNative}} = v.s
+{{- else if eq .Type "binary"}}
+		d.obj.{{.NameNative}} = v.b
+{{- else if .TypeRef}}
+		d.obj.{{.NameNative}} = v.obj.(*{{.TypeNative}})
+{{- else}}
+		d.obj.{{.NameNative}} = {{.TypeNative}}(v.u)
+{{- end}}
+{{- end}}
+	}
+}
+
+// feedChild honors the colferStreamHooks interface.
+func (d *{{.NameNative}}Decoder) feedChild(field int, data []byte) (int, interface{}, error) {
+	switch field {
+{{- range .Fields}}{{if .TypeRef}}
+	case {{.Index}}:
+		if d.child{{.NameNative}} == nil {
+			d.child{{.NameNative}} = new({{.TypeNative}}Decoder)
+		}
+		n, o, err := d.child{{.NameNative}}.Feed(data)
+		if err != nil || o == nil {
+			return n, nil, err
+		}
+		return n, o, nil
+{{- end}}{{end}}
+	}
+	return 0, nil, nil
+}

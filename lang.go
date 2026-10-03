@@ -184,11 +184,14 @@ func goMod(dir string) (modDir, modPkg string, err error) {
 // GenerateGo writes the code into file "Colfer.go".
 func GenerateGo(basedir string, packages Packages) error {
 	t := template.New("go-code")
+	t.Funcs(template.FuncMap{"decKind": goDecKind})
 	template.Must(t.Parse(goCode))
 	template.Must(t.New("marshal-field").Parse(goMarshalField))
 	template.Must(t.New("marshal-field-len").Parse(goMarshalFieldLen))
 	template.Must(t.New("unmarshal-field").Parse(goUnmarshalField))
 	template.Must(t.New("unmarshal-varint").Parse(goUnmarshalVarint))
+	template.Must(t.New("decoder-engine").Parse(goDecoderEngine))
+	template.Must(t.New("decoder-struct").Parse(goDecoderStruct))
 
 	modDir, modPkg, err := goMod(basedir)
 	if err != nil {
@@ -267,6 +270,44 @@ var goUnmarshalField string
 
 //go:embed template/go-unmarshal-varint.txt
 var goUnmarshalVarint string
+
+//go:embed template/go-decoder-engine.txt
+var goDecoderEngine string
+
+//go:embed template/go-decoder-struct.txt
+var goDecoderStruct string
+
+// goDecKind maps the field datatype to its colferDec* op kind.
+func goDecKind(f *Field) string {
+	switch f.Type {
+	case "bool":
+		return "colferDecBool"
+	case "uint8":
+		return "colferDecUint8"
+	case "uint16":
+		return "colferDecUint16"
+	case "uint32":
+		return "colferDecUint32"
+	case "uint64":
+		return "colferDecUint64"
+	case "int32":
+		return "colferDecInt32"
+	case "int64":
+		return "colferDecInt64"
+	case "float32":
+		return "colferDecFloat32"
+	case "float64":
+		return "colferDecFloat64"
+	case "timestamp":
+		return "colferDecTimestamp"
+	case "text":
+		return "colferDecText"
+	case "binary":
+		return "colferDecBinary"
+	default:
+		return "colferDecObject"
+	}
+}
 
 // JavaKeywords are the reserved tokens for Java code.
 // Some entries are redundant due to the use of a Go parser.
