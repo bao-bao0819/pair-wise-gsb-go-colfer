@@ -136,6 +136,186 @@ func TestUnmarshalEOF(t *testing.T) {
 	}
 }
 
+func TestViewUnmarshal(t *testing.T) {
+	for _, gold := range newGoldenCases() {
+		data, err := hex.DecodeString(gold.serial)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		view, n, err := UnmarshalOView(data)
+		if err != nil {
+			t.Errorf("0x%s: %s", gold.serial, err)
+			continue
+		}
+		if n != len(data) {
+			t.Errorf("0x%s: got %d bytes read, want %d", gold.serial, n, len(data))
+		}
+
+		// work around NaN != NaN
+		got, want := *view.Detach(), gold.object
+		if math.IsNaN(float64(got.F32)) && math.IsNaN(float64(want.F32)) {
+			got.F32, want.F32 = 0, 0
+		}
+		if math.IsNaN(got.F64) && math.IsNaN(want.F64) {
+			got.F64, want.F64 = 0, 0
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("0x%s: got %+v, want %+v", gold.serial, got, want)
+		}
+	}
+}
+
+func TestViewBorrow(t *testing.T) {
+	want := O{
+		S:  "keep me",
+		A:  []byte{1, 2, 3},
+		O:  &O{A: []byte{4, 5}},
+		Os: []*O{{A: []byte{6}}, {A: []byte{7, 8}}},
+		As: [][]byte{{9}, {10, 11}},
+	}
+	data, err := want.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	view, _, err := UnmarshalOView(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// flip all source content
+	for i := range data {
+		data[i] ^= 0xff
+	}
+
+	// binaries follow the source buffer, nesting included
+	borrowed := [][]byte{view.A, view.O.A, view.Os[0].A, view.Os[1].A, view.As[0], view.As[1]}
+	orig := [][]byte{want.A, want.O.A, want.Os[0].A, want.Os[1].A, want.As[0], want.As[1]}
+	for i, got := range borrowed {
+		for j, b := range got {
+			if want := orig[i][j] ^ 0xff; b != want {
+				t.Errorf("borrowed field %d byte %d: got %#x, want %#x after source flip", i, j, b, want)
+			}
+		}
+	}
+
+	// text remains a safe copy
+	if view.S != want.S {
+		t.Errorf("text changed with source: got %q, want %q", view.S, want.S)
+	}
+}
+
+func TestViewDetach(t *testing.T) {
+	want := O{
+		B:    true,
+		U32:  1,
+		S:    "text",
+		A:    []byte{1, 2, 3},
+		O:    &O{A: []byte{4}},
+		Os:   []*O{{A: []byte{5}}, {}},
+		Ss:   []string{"a", "b"},
+		As:   [][]byte{{6}, {7, 8}},
+		F32s: []float32{1.5},
+	}
+	data, err := want.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	view, _, err := UnmarshalOView(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := view.Detach()
+
+	// destroy the source
+	for i := range data {
+		data[i] = 0
+	}
+
+	if !reflect.DeepEqual(*got, want) {
+		t.Errorf("got %+v, want %+v", *got, want)
+	}
+
+	var nilView *OView
+	if nilView.Detach() != nil {
+		t.Error("Detach on nil view did not return nil")
+	}
+}
+
+func TestViewSliceCap(t *testing.T) {
+	o := O{
+		A:  []byte{1, 2, 3},
+		As: [][]byte{{4}, {5, 6}},
+		S:  "next",
+	}
+	data, err := o.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := append([]byte(nil), data...)
+
+	view, _, err := UnmarshalOView(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	borrowed := []struct {
+		name string
+		b    []byte
+	}{
+		{"A", view.A},
+		{"As[0]", view.As[0]},
+		{"As[1]", view.As[1]},
+	}
+	for _, x := range borrowed {
+		if cap(x.b) != len(x.b) {
+			t.Errorf("%s: got capacity %d, want %d", x.name, cap(x.b), len(x.b))
+		}
+	}
+
+	// appends must not write into the source buffer
+	view.A = append(view.A, 7)
+	view.As[0] = append(view.As[0], 8)
+	view.As[1] = append(view.As[1], 9, 10)
+	if !bytes.Equal(data, snapshot) {
+		t.Error("append on a view field wrote into the source buffer")
+	}
+	if !bytes.Equal(view.A, []byte{1, 2, 3, 7}) {
+		t.Errorf("A: got %v after append", view.A)
+	}
+}
+
+func TestViewError(t *testing.T) {
+	for _, gold := range newGoldenCases() {
+		data, err := hex.DecodeString(gold.serial)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for i := range data {
+			view, _, err := UnmarshalOView(data[:i])
+			if err != io.EOF {
+				t.Errorf("0x%s: got error %T: %q", hex.EncodeToString(data[:i]), err, err)
+			}
+			if view != nil {
+				t.Errorf("0x%s: view published on error", hex.EncodeToString(data[:i]))
+			}
+		}
+	}
+
+	// size limit breach
+	if view, _, err := UnmarshalOView([]byte{0x09, 0xff, 0xff, 0xff, 0xff, 0x0f}); err == nil || view != nil {
+		t.Errorf("got view %+v and error %v for oversized binary", view, err)
+	}
+
+	// unknown header
+	if view, _, err := UnmarshalOView([]byte{0x37, 0x7f}); err == nil || view != nil {
+		t.Errorf("got view %+v and error %v for unknown header", view, err)
+	}
+}
+
 func TestUnmarshalSizeMax(t *testing.T) {
 	orig := ColferSizeMax
 	defer func() {
@@ -206,6 +386,14 @@ func FuzzO(f *testing.F) {
 		_, err = o.MarshalBinary()
 		if err != nil {
 			t.Fatal("marshal error:", err)
+		}
+
+		view, _, err := UnmarshalOView(data)
+		if err != nil {
+			t.Fatal("view decode error after successful unmarshal:", err)
+		}
+		if _, err := view.Detach().MarshalBinary(); err != nil {
+			t.Fatal("marshal error after detach:", err)
 		}
 	})
 }

@@ -241,12 +241,23 @@ type Field struct {
 	Type string
 	// TypeNative is the language specific Type.
 	TypeNative string
+	// TypeView is the language specific Type for read-only views.
+	TypeView string
 	// TypeRef is the Colfer data structure reference.
 	TypeRef *Struct
 	// TypeList flags whether the datatype is a list.
 	TypeList bool
+	// ViewMode flags decoding as a read-only view.
+	ViewMode bool
 	// TagAdd has optional source code additions.
 	TagAdd []string
+}
+
+// AsView returns a copy of f flagged for view decoding.
+func (f *Field) AsView() *Field {
+	v := *f
+	v.ViewMode = true
+	return &v
 }
 
 // DocText returns the documentation lines prefixed with ident.

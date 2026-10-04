@@ -212,18 +212,24 @@ func GenerateGo(basedir string, packages Packages) error {
 				default:
 					if f.TypeRef == nil {
 						f.TypeNative = f.Type
+						f.TypeView = f.Type
 					} else {
 						f.TypeNative = f.TypeRef.NameNative
+						f.TypeView = f.TypeRef.NameNative + "View"
 						if f.TypeRef.Pkg != p {
 							f.TypeNative = f.TypeRef.Pkg.NameNative + "." + f.TypeNative
+							f.TypeView = f.TypeRef.Pkg.NameNative + "." + f.TypeView
 						}
 					}
 				case "timestamp":
 					f.TypeNative = "time.Time"
+					f.TypeView = "time.Time"
 				case "text":
 					f.TypeNative = "string"
+					f.TypeView = "string"
 				case "binary":
 					f.TypeNative = "[]byte"
+					f.TypeView = "[]byte"
 				}
 			}
 		}

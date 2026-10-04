@@ -221,6 +221,19 @@ The following table shows how Colfer data types are applied per language.
 
 Lists may contain floating points, text, binaries or data structures.
 
+### Go Views
+
+The Go generator also emits a `<Type>View` per struct for zero-copy reads.
+`Unmarshal<Type>View(data)` decodes a serial into a read-only view in which
+binary fields borrow sub-slices from `data`—with the capacity limited to the
+field content—while texts and numbers are plain copies. Nested structures and
+lists decode as views under the same borrowing rules. The source buffer must
+remain available and unmodified for as long as the view is in use. All
+validation completes before the view is published: on error the view is nil.
+Method `Detach` copies everything into a regular `<Type>` value which is
+independent of the source buffer. The ownership guarantees of `Marshal` and
+`Unmarshal` remain unchanged.
+
 
 
 ## Security

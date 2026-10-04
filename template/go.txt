@@ -129,4 +129,103 @@ func (o *{{.NameNative}}) UnmarshalBinary(data []byte) error {
 	}
 	return err
 }
+
+// {{.NameNative}}View is a read-only view of a {{.NameNative}}.
+// Binary fields share memory with the buffer passed to UnmarshalView.
+// The buffer must remain available and unmodified for as long as the
+// view is in use. Method Detach returns a fully independent copy.
+type {{.NameNative}}View struct {
+{{range .Fields}}{{.DocText "\t// "}}
+	{{.NameNative}}	{{if .TypeList}}[]{{end}}{{if .TypeRef}}*{{end}}{{.TypeView}}
+{{end}}}
+
+// Unmarshal{{.NameNative}}View decodes data as Colfer and returns a
+// read-only view with the number of bytes read. All validation completes
+// before the view is published: the view is nil when err is not nil.
+// See {{.NameNative}}View.UnmarshalView for the error return options.
+func Unmarshal{{.NameNative}}View(data []byte) (*{{.NameNative}}View, int, error) {
+	o := new({{.NameNative}}View)
+	n, err := o.UnmarshalView(data)
+	if err != nil {
+		return nil, 0, err
+	}
+	return o, n, nil
+}
+
+// UnmarshalView decodes data as Colfer and returns the number of bytes read.
+// Binary fields borrow sub-slices from data, with the capacity limited to
+// the respective field content to prevent append overruns. The buffer must
+// remain available and unmodified for as long as o is in use. All other
+// fields, texts included, are plain copies. Nested structures and lists
+// decode as views with the same borrowing rules.
+// The error return options are io.EOF, ColferError and ColferMax.
+// The content of o is undefined when an error occurs.
+func (o *{{.NameNative}}View) UnmarshalView(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, io.EOF
+	}
+	header := data[0]
+	i := 1
+{{range .Fields}}{{template "unmarshal-field" .AsView}}{{end}}
+	if header != 0x7f {
+		return 0, ColferError(i - 1)
+	}
+	if i < ColferSizeMax {
+		return i, nil
+	}
+eof:
+	if i >= ColferSizeMax {
+		return 0, ColferMax(fmt.Sprintf("colfer: struct {{.String}} size exceeds %d bytes", ColferSizeMax))
+	}
+	return 0, io.EOF
+}
+
+// Detach returns o as a {{.NameNative}} with all data copied.
+// The result is independent of the buffer passed to UnmarshalView.
+func (o *{{.NameNative}}View) Detach() *{{.NameNative}} {
+	if o == nil {
+		return nil
+	}
+	d := new({{.NameNative}})
+{{range .Fields}}
+{{- if .TypeRef}}
+{{- if .TypeList}}
+	if o.{{.NameNative}} != nil {
+		a := make([]*{{.TypeNative}}, len(o.{{.NameNative}}))
+		for ai, v := range o.{{.NameNative}} {
+			a[ai] = v.Detach()
+		}
+		d.{{.NameNative}} = a
+	}
+{{- else}}
+	d.{{.NameNative}} = o.{{.NameNative}}.Detach()
+{{- end}}
+{{- else if .TypeList}}
+	if o.{{.NameNative}} != nil {
+		a := make([]{{.TypeNative}}, len(o.{{.NameNative}}))
+{{- if eq .Type "binary"}}
+		for ai, v := range o.{{.NameNative}} {
+			if v != nil {
+				c := make([]byte, len(v))
+				copy(c, v)
+				a[ai] = c
+			}
+		}
+{{- else}}
+		copy(a, o.{{.NameNative}})
+{{- end}}
+		d.{{.NameNative}} = a
+	}
+{{- else if eq .Type "binary"}}
+	if o.{{.NameNative}} != nil {
+		v := make([]byte, len(o.{{.NameNative}}))
+		copy(v, o.{{.NameNative}})
+		d.{{.NameNative}} = v
+	}
+{{- else}}
+	d.{{.NameNative}} = o.{{.NameNative}}
+{{- end}}
+{{- end}}
+	return d
+}
 {{end}}

@@ -364,3 +364,229 @@ func (o *Header) UnmarshalBinary(data []byte) error {
 	}
 	return err
 }
+
+// HeaderView is a read-only view of a Header.
+// Binary fields share memory with the buffer passed to UnmarshalView.
+// The buffer must remain available and unmodified for as long as the
+// view is in use. Method Detach returns a fully independent copy.
+type HeaderView struct {
+	SeqID uint64
+
+	Method string
+
+	Error string
+
+	BodySize uint32
+}
+
+// UnmarshalHeaderView decodes data as Colfer and returns a
+// read-only view with the number of bytes read. All validation completes
+// before the view is published: the view is nil when err is not nil.
+// See HeaderView.UnmarshalView for the error return options.
+func UnmarshalHeaderView(data []byte) (*HeaderView, int, error) {
+	o := new(HeaderView)
+	n, err := o.UnmarshalView(data)
+	if err != nil {
+		return nil, 0, err
+	}
+	return o, n, nil
+}
+
+// UnmarshalView decodes data as Colfer and returns the number of bytes read.
+// Binary fields borrow sub-slices from data, with the capacity limited to
+// the respective field content to prevent append overruns. The buffer must
+// remain available and unmodified for as long as o is in use. All other
+// fields, texts included, are plain copies. Nested structures and lists
+// decode as views with the same borrowing rules.
+// The error return options are io.EOF, ColferError and ColferMax.
+// The content of o is undefined when an error occurs.
+func (o *HeaderView) UnmarshalView(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, io.EOF
+	}
+	header := data[0]
+	i := 1
+
+	if header == 0 {
+		start := i
+		i++
+		if i >= len(data) {
+			goto eof
+		}
+		x := uint64(data[start])
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				b := uint64(data[i])
+				i++
+				if i >= len(data) {
+					goto eof
+				}
+
+				if b < 0x80 || shift == 56 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+		o.SeqID = x
+
+		header = data[i]
+		i++
+	} else if header == 0|0x80 {
+		start := i
+		i += 8
+		if i >= len(data) {
+			goto eof
+		}
+		o.SeqID = intconv.Uint64(data[start:])
+		header = data[i]
+		i++
+	}
+
+	if header == 1 {
+		if i >= len(data) {
+			goto eof
+		}
+		x := uint(data[i])
+		i++
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				if i >= len(data) {
+					goto eof
+				}
+				b := uint(data[i])
+				i++
+
+				if b < 0x80 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+
+		if x > uint(ColferSizeMax) {
+			return 0, ColferMax(fmt.Sprintf("colfer: internal.header.method size %d exceeds %d bytes", x, ColferSizeMax))
+		}
+
+		start := i
+		i += int(x)
+		if i >= len(data) {
+			goto eof
+		}
+		o.Method = string(data[start:i])
+
+		header = data[i]
+		i++
+	}
+
+	if header == 2 {
+		if i >= len(data) {
+			goto eof
+		}
+		x := uint(data[i])
+		i++
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				if i >= len(data) {
+					goto eof
+				}
+				b := uint(data[i])
+				i++
+
+				if b < 0x80 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+
+		if x > uint(ColferSizeMax) {
+			return 0, ColferMax(fmt.Sprintf("colfer: internal.header.error size %d exceeds %d bytes", x, ColferSizeMax))
+		}
+
+		start := i
+		i += int(x)
+		if i >= len(data) {
+			goto eof
+		}
+		o.Error = string(data[start:i])
+
+		header = data[i]
+		i++
+	}
+
+	if header == 3 {
+		start := i
+		i++
+		if i >= len(data) {
+			goto eof
+		}
+		x := uint32(data[start])
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				b := uint32(data[i])
+				i++
+				if i >= len(data) {
+					goto eof
+				}
+
+				if b < 0x80 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+		o.BodySize = x
+
+		header = data[i]
+		i++
+	} else if header == 3|0x80 {
+		start := i
+		i += 4
+		if i >= len(data) {
+			goto eof
+		}
+		o.BodySize = intconv.Uint32(data[start:])
+		header = data[i]
+		i++
+	}
+
+	if header != 0x7f {
+		return 0, ColferError(i - 1)
+	}
+	if i < ColferSizeMax {
+		return i, nil
+	}
+eof:
+	if i >= ColferSizeMax {
+		return 0, ColferMax(fmt.Sprintf("colfer: struct internal.header size exceeds %d bytes", ColferSizeMax))
+	}
+	return 0, io.EOF
+}
+
+// Detach returns o as a Header with all data copied.
+// The result is independent of the buffer passed to UnmarshalView.
+func (o *HeaderView) Detach() *Header {
+	if o == nil {
+		return nil
+	}
+	d := new(Header)
+
+	d.SeqID = o.SeqID
+	d.Method = o.Method
+	d.Error = o.Error
+	d.BodySize = o.BodySize
+	return d
+}

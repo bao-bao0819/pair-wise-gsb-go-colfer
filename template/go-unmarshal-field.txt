@@ -464,6 +464,15 @@
 		if x > uint(ColferSizeMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: {{.String}} size %d exceeds %d bytes", x, ColferSizeMax))
 		}
+  {{- if .ViewMode}}
+		start := i
+		i += int(x)
+		if i >= len(data) {
+			goto eof
+		}
+		// borrow the buffer with the capacity limited to the field
+		o.{{.NameNative}} = data[start:i:i]
+  {{- else}}
 		v := make([]byte, int(x))
 
 		start := i
@@ -473,6 +482,7 @@
 		}
 		copy(v, data[start:i])
 		o.{{.NameNative}} = v
+  {{- end}}
 
 		header = data[i]
 		i++
@@ -487,6 +497,16 @@
 			if x > uint(ColferSizeMax) {
 				return 0, ColferMax(fmt.Sprintf("colfer: {{.String}} element %d size %d exceeds %d bytes", ai, x, ColferSizeMax))
 			}
+  {{- if .ViewMode}}
+			start := i
+			i += int(x)
+			if i >= len(data) {
+				goto eof
+			}
+
+			// borrow the buffer with the capacity limited to the element
+			a[ai] = data[start:i:i]
+  {{- else}}
 			v := make([]byte, int(x))
 
 			start := i
@@ -497,6 +517,7 @@
 
 			copy(v, data[start:i])
 			a[ai] = v
+  {{- end}}
 		}
 
 		if i >= len(data) {
@@ -514,13 +535,18 @@
 		}
 
 		l := int(x)
+{{- if .ViewMode}}
+		a := make([]*{{.TypeView}}, l)
+		malloc := make([]{{.TypeView}}, l)
+{{- else}}
 		a := make([]*{{.TypeNative}}, l)
 		malloc := make([]{{.TypeNative}}, l)
+{{- end}}
 		for ai := range a {
 			v := &malloc[ai]
 			a[ai] = v
 
-			n, err := v.Unmarshal(data[i:])
+			n, err := v.Unmarshal{{if .ViewMode}}View{{end}}(data[i:])
 			if err != nil {
 				if err == io.EOF && len(data) >= ColferSizeMax {
 					return 0, ColferMax(fmt.Sprintf("colfer: {{.Struct.String}} size exceeds %d bytes", ColferSizeMax))
@@ -539,8 +565,13 @@
 	}
 {{else}}
 	if header == {{.Index}} {
+{{- if .ViewMode}}
+		o.{{.NameNative}} = new({{.TypeView}})
+		n, err := o.{{.NameNative}}.UnmarshalView(data[i:])
+{{- else}}
 		o.{{.NameNative}} = new({{.TypeNative}})
 		n, err := o.{{.NameNative}}.Unmarshal(data[i:])
+{{- end}}
 		if err != nil {
 			if err == io.EOF && len(data) >= ColferSizeMax {
 				return 0, ColferMax(fmt.Sprintf("colfer: {{.Struct.String}} size exceeds %d bytes", ColferSizeMax))
