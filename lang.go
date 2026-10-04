@@ -1,7 +1,6 @@
 package colfer
 
 import (
-	"bytes"
 	_ "embed"
 	"io/ioutil"
 	"os"
@@ -183,74 +182,11 @@ func goMod(dir string) (modDir, modPkg string, err error) {
 
 // GenerateGo writes the code into file "Colfer.go".
 func GenerateGo(basedir string, packages Packages) error {
-	t := template.New("go-code")
-	template.Must(t.Parse(goCode))
-	template.Must(t.New("marshal-field").Parse(goMarshalField))
-	template.Must(t.New("marshal-field-len").Parse(goMarshalFieldLen))
-	template.Must(t.New("unmarshal-field").Parse(goUnmarshalField))
-	template.Must(t.New("unmarshal-varint").Parse(goUnmarshalVarint))
-
-	modDir, modPkg, err := goMod(basedir)
+	plan, err := PlanGo(basedir, packages)
 	if err != nil {
 		return err
 	}
-
-	for _, p := range packages {
-		p.NameNative = p.Name[strings.LastIndexByte(p.Name, '/')+1:]
-		for _, t := range p.Structs {
-			t.NameNative = name.CamelCase(t.Name, true)
-			for _, f := range t.Fields {
-				f.NameNative = name.CamelCase(f.Name, true)
-			}
-		}
-	}
-
-	for _, p := range packages {
-		for _, t := range p.Structs {
-			for _, f := range t.Fields {
-				switch f.Type {
-				default:
-					if f.TypeRef == nil {
-						f.TypeNative = f.Type
-					} else {
-						f.TypeNative = f.TypeRef.NameNative
-						if f.TypeRef.Pkg != p {
-							f.TypeNative = f.TypeRef.Pkg.NameNative + "." + f.TypeNative
-						}
-					}
-				case "timestamp":
-					f.TypeNative = "time.Time"
-				case "text":
-					f.TypeNative = "string"
-				case "binary":
-					f.TypeNative = "[]byte"
-				}
-			}
-		}
-
-		var buf bytes.Buffer
-		if err := t.Execute(&buf, p); err != nil {
-			return err
-		}
-
-		path := filepath.Join(basedir, p.Name)
-		if modPkg != "" && strings.HasPrefix(p.Name, modPkg+"/") {
-			path = filepath.Join(modDir, p.Name[len(modPkg):])
-		}
-		if err := os.MkdirAll(path, 0777); err != nil {
-			return err
-		}
-
-		path = filepath.Join(path, "Colfer.go")
-		if err := ioutil.WriteFile(path, buf.Bytes(), 0666); err != nil {
-			return err
-		}
-
-		if _, err := FormatFile(path); err != nil {
-			return err
-		}
-	}
-	return nil
+	return plan.Commit()
 }
 
 //go:embed template/go.txt
