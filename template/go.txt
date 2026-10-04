@@ -14,8 +14,8 @@ import (
 {{- if .HasTimestamp}}
 	"time"
 {{- end}}
-{{- range .Refs}}
-	"{{.Name}}"
+{{- range .GoImports}}
+	{{if .Alias}}{{.Qual}} {{end}}"{{.Path}}"
 {{- end}}
 )
 

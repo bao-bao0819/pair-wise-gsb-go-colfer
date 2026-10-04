@@ -70,6 +70,9 @@ type Package struct {
 	InterfaceNatives []string
 	// CodeSnippet is helpful in book-keeping functionality.
 	CodeSnippet string
+	// GoImports are the import paths with optional aliases for
+	// generated Go code.
+	GoImports []GoImport
 }
 
 // DocText returns the documentation lines prefixed with ident.

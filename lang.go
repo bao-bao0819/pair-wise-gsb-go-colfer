@@ -2,7 +2,10 @@ package colfer
 
 import (
 	"bytes"
+	"crypto/sha256"
 	_ "embed"
+	"fmt"
+	"go/format"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -181,8 +184,48 @@ func goMod(dir string) (modDir, modPkg string, err error) {
 	return "", "", nil // not found
 }
 
+// GoImport is an import path with an optional alias for generated Go code.
+type GoImport struct {
+	// Path is the import path.
+	Path string
+	// Qual is the qualifier used in the generated code.
+	Qual string
+	// Alias flags whether Qual differs from the package name,
+	// i.e. the import requires an explicit alias.
+	Alias bool
+}
+
+// goIdentsReserved are the package-level identifiers in generated Go code.
+var goIdentsReserved = []string{
+	"intconv", "ColferSizeMax", "ColferListMax",
+	"ColferMax", "ColferError", "ColferTail",
+}
+
+// goMethodsReserved are the method names in generated Go code.
+var goMethodsReserved = []string{
+	"MarshalTo", "MarshalLen", "MarshalBinary",
+	"Unmarshal", "UnmarshalBinary",
+}
+
 // GenerateGo writes the code into file "Colfer.go".
 func GenerateGo(basedir string, packages Packages) error {
+	plan, err := PlanGo(basedir, packages)
+	if err != nil {
+		return err
+	}
+	if len(plan.Files) == 0 {
+		return nil
+	}
+	return plan.Commit(basedir)
+}
+
+// PlanGo renders the Go code for packages into a Plan. The basedir is
+// the commit target; it is used for go.mod resolution and for the file
+// paths in the Plan. PlanGo does not write to the filesystem. The
+// returned Plan is deterministic: the same schema input always produces
+// the same file content, regardless of map iteration order or previous
+// calls.
+func PlanGo(basedir string, packages Packages) (*Plan, error) {
 	t := template.New("go-code")
 	template.Must(t.Parse(goCode))
 	template.Must(t.New("marshal-field").Parse(goMarshalField))
@@ -190,9 +233,13 @@ func GenerateGo(basedir string, packages Packages) error {
 	template.Must(t.New("unmarshal-field").Parse(goUnmarshalField))
 	template.Must(t.New("unmarshal-varint").Parse(goUnmarshalVarint))
 
+	absBase, err := filepath.Abs(basedir)
+	if err != nil {
+		return nil, err
+	}
 	modDir, modPkg, err := goMod(basedir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	for _, p := range packages {
@@ -204,8 +251,15 @@ func GenerateGo(basedir string, packages Packages) error {
 			}
 		}
 	}
+	if err := checkGoIdents(packages); err != nil {
+		return nil, err
+	}
 
+	plan := new(Plan)
+	fold := make(map[string]string, len(packages))
 	for _, p := range packages {
+		quals := planGoImports(p)
+
 		for _, t := range p.Structs {
 			for _, f := range t.Fields {
 				switch f.Type {
@@ -215,7 +269,7 @@ func GenerateGo(basedir string, packages Packages) error {
 					} else {
 						f.TypeNative = f.TypeRef.NameNative
 						if f.TypeRef.Pkg != p {
-							f.TypeNative = f.TypeRef.Pkg.NameNative + "." + f.TypeNative
+							f.TypeNative = quals[f.TypeRef.Pkg] + "." + f.TypeNative
 						}
 					}
 				case "timestamp":
@@ -230,27 +284,115 @@ func GenerateGo(basedir string, packages Packages) error {
 
 		var buf bytes.Buffer
 		if err := t.Execute(&buf, p); err != nil {
-			return err
+			return nil, err
+		}
+		content, err := format.Source(buf.Bytes())
+		if err != nil {
+			return nil, fmt.Errorf("colfer: generated Go for package %s: %s", p.Name, err)
 		}
 
-		path := filepath.Join(basedir, p.Name)
+		target := filepath.Join(absBase, filepath.FromSlash(p.Name))
 		if modPkg != "" && strings.HasPrefix(p.Name, modPkg+"/") {
-			path = filepath.Join(modDir, p.Name[len(modPkg):])
+			target = filepath.Join(modDir, filepath.FromSlash(p.Name[len(modPkg):]))
 		}
-		if err := os.MkdirAll(path, 0777); err != nil {
-			return err
+		target = filepath.Join(target, "Colfer.go")
+		rel, err := filepath.Rel(absBase, target)
+		if err != nil {
+			return nil, err
 		}
+		relSlash := filepath.ToSlash(rel)
+		if !validPlanPath(relSlash) {
+			return nil, fmt.Errorf("colfer: package %s target %q is not within the base directory %q", p.Name, target, basedir)
+		}
+		if prev, ok := fold[strings.ToUpper(relSlash)]; ok {
+			return nil, fmt.Errorf("colfer: target paths %q and %q conflict on case-insensitive filesystems", prev, relSlash)
+		}
+		fold[strings.ToUpper(relSlash)] = relSlash
 
-		path = filepath.Join(path, "Colfer.go")
-		if err := ioutil.WriteFile(path, buf.Bytes(), 0666); err != nil {
-			return err
+		f, err := plan.newFile(relSlash, content)
+		if err != nil {
+			return nil, err
 		}
+		switch prev, err := osReadFile(target); {
+		case os.IsNotExist(err):
+			// new file
+		case err != nil:
+			return nil, err
+		default:
+			f.replace = true
+			f.previous = sha256.Sum256(prev)
+		}
+	}
+	plan.sortFiles()
+	return plan, nil
+}
 
-		if _, err := FormatFile(path); err != nil {
-			return err
+// checkGoIdents verifies that the native Go identifiers are unique
+// within their respective scope and free of conflicts with the
+// generated code.
+func checkGoIdents(packages Packages) error {
+	for _, p := range packages {
+		structs := make(map[string]*Struct, len(p.Structs))
+		for _, t := range p.Structs {
+			for _, reserved := range goIdentsReserved {
+				if t.NameNative == reserved {
+					return fmt.Errorf("colfer: struct %s maps to Go identifier %s, which is reserved by the generated code", t, reserved)
+				}
+			}
+			if dupe, ok := structs[t.NameNative]; ok {
+				return fmt.Errorf("colfer: structs %s and %s both map to Go identifier %s", dupe, t, t.NameNative)
+			}
+			structs[t.NameNative] = t
+
+			fields := make(map[string]*Field, len(t.Fields))
+			for _, f := range t.Fields {
+				for _, reserved := range goMethodsReserved {
+					if f.NameNative == reserved {
+						return fmt.Errorf("colfer: field %s maps to Go identifier %s, which is reserved by the generated code", f, reserved)
+					}
+				}
+				if dupe, ok := fields[f.NameNative]; ok {
+					return fmt.Errorf("colfer: fields %s and %s both map to Go identifier %s", dupe, f, f.NameNative)
+				}
+				fields[f.NameNative] = f
+			}
 		}
 	}
 	return nil
+}
+
+// planGoImports sets the Go import aliases for p and returns the
+// qualifier per referenced package. Aliases are assigned in sorted
+// import-path order to keep the output deterministic.
+func planGoImports(p *Package) map[*Package]string {
+	refs := p.Refs()
+	used := make(map[string]struct{}, len(refs)+len(p.Structs)+len(goIdentsReserved))
+	for _, ident := range goIdentsReserved {
+		used[ident] = struct{}{}
+	}
+	for _, t := range p.Structs {
+		used[t.NameNative] = struct{}{}
+	}
+
+	imports := make([]GoImport, 0, len(refs))
+	quals := make(map[*Package]string, len(refs))
+	for _, r := range refs {
+		qual := r.NameNative
+		if _, taken := used[qual]; taken {
+			for n := 2; ; n++ {
+				candidate := fmt.Sprintf("%s%d", r.NameNative, n)
+				if _, taken := used[candidate]; !taken {
+					qual = candidate
+					break
+				}
+			}
+		}
+		used[qual] = struct{}{}
+		quals[r] = qual
+		imports = append(imports, GoImport{Path: r.Name, Qual: qual, Alias: qual != r.NameNative})
+	}
+	p.GoImports = imports
+	return quals
 }
 
 //go:embed template/go.txt
