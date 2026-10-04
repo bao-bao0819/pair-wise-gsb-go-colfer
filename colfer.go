@@ -241,6 +241,8 @@ type Field struct {
 	Type string
 	// TypeNative is the language specific Type.
 	TypeNative string
+	// TypeViewNative is the Go view type for a Colfer struct reference.
+	TypeViewNative string
 	// TypeRef is the Colfer data structure reference.
 	TypeRef *Struct
 	// TypeList flags whether the datatype is a list.

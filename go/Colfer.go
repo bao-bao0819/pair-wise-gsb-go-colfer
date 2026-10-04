@@ -873,6 +873,7 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 		if x > uint(ColferSizeMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: gen.o.a size %d exceeds %d bytes", x, ColferSizeMax))
 		}
+
 		v := make([]byte, int(x))
 
 		start := i
@@ -888,8 +889,10 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 	}
 
 	if header == 10 {
+
 		o.O = new(O)
 		n, err := o.O.Unmarshal(data[i:])
+
 		if err != nil {
 			if err == io.EOF && len(data) >= ColferSizeMax {
 				return 0, ColferMax(fmt.Sprintf("colfer: gen.o size exceeds %d bytes", ColferSizeMax))
@@ -934,13 +937,16 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 		}
 
 		l := int(x)
+
 		a := make([]*O, l)
 		malloc := make([]O, l)
+
 		for ai := range a {
 			v := &malloc[ai]
 			a[ai] = v
 
 			n, err := v.Unmarshal(data[i:])
+
 			if err != nil {
 				if err == io.EOF && len(data) >= ColferSizeMax {
 					return 0, ColferMax(fmt.Sprintf("colfer: gen.o size exceeds %d bytes", ColferSizeMax))
@@ -1059,7 +1065,9 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 			return 0, ColferMax(fmt.Sprintf("colfer: gen.o.as length %d exceeds %d elements", x, ColferListMax))
 		}
 		a := make([][]byte, int(x))
+
 		o.As = a
+
 		for ai := range a {
 			if i >= len(data) {
 				goto eof
@@ -1087,6 +1095,7 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 			if x > uint(ColferSizeMax) {
 				return 0, ColferMax(fmt.Sprintf("colfer: gen.o.as element %d size %d exceeds %d bytes", ai, x, ColferSizeMax))
 			}
+
 			v := make([]byte, int(x))
 
 			start := i
@@ -1097,6 +1106,7 @@ func (o *O) Unmarshal(data []byte) (int, error) {
 
 			copy(v, data[start:i])
 			a[ai] = v
+
 		}
 
 		if i >= len(data) {
@@ -1249,6 +1259,837 @@ func (o *O) UnmarshalBinary(data []byte) error {
 	return err
 }
 
+// OView is a zero-copy read view of O.
+//
+// Binary fields, including those nested in lists and struct fields, borrow
+// their bytes from the input passed to UnmarshalView. The input must be
+// treated as read-only and it must remain allocated and unmodified for the
+// lifetime of the view. Each borrowed slice is capped to its own field
+// boundary, so appending to one can never overwrite a neighbouring field.
+// Text fields are copied into strings, as the Go string contract requires.
+// Use Detach to release all references to the input and obtain an
+// independent, fully owned O.
+type OView struct {
+	// B tests booleans.
+	B bool
+	// U32 tests unsigned 32-bit integers.
+	U32 uint32
+	// U64 tests unsigned 64-bit integers.
+	U64 uint64
+	// I32 tests signed 32-bit integers.
+	I32 int32
+	// I64 tests signed 64-bit integers.
+	I64 int64
+	// F32 tests 32-bit floating points.
+	F32 float32
+	// F64 tests 64-bit floating points.
+	F64 float64
+	// T tests timestamps.
+	T time.Time
+	// S tests text.
+	S string
+	// A tests binaries.
+	A []byte
+	// O tests nested data structures.
+	O *OView
+	// Os tests data structure lists.
+	Os []*OView
+	// Ss tests text lists.
+	Ss []string
+	// As tests binary lists.
+	As [][]byte
+	// U8 tests unsigned 8-bit integers.
+	U8 uint8
+	// U16 tests unsigned 16-bit integers.
+	U16 uint16
+	// F32s tests 32-bit floating point lists.
+	F32s []float32
+	// F64s tests 64-bit floating point lists.
+	F64s []float64
+}
+
+// UnmarshalView decodes data as Colfer into v and returns the number of bytes
+// read. All validation, length and type checks complete before v is
+// published: on error v is left untouched and no partial view is returned.
+//
+// The returned view borrows binary bytes from data for fields of type binary.
+// Keep data alive and do not mutate it while the view, or any view derived
+// from it, is in use. The error return options are io.EOF, ColferError and
+// ColferMax.
+func (v *OView) UnmarshalView(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, io.EOF
+	}
+
+	o := new(OView)
+	header := data[0]
+	i := 1
+
+	if header == 0 {
+		if i >= len(data) {
+			goto eof
+		}
+		o.B = true
+		header = data[i]
+		i++
+	}
+
+	if header == 1 {
+		start := i
+		i++
+		if i >= len(data) {
+			goto eof
+		}
+		x := uint32(data[start])
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				b := uint32(data[i])
+				i++
+				if i >= len(data) {
+					goto eof
+				}
+
+				if b < 0x80 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+		o.U32 = x
+
+		header = data[i]
+		i++
+	} else if header == 1|0x80 {
+		start := i
+		i += 4
+		if i >= len(data) {
+			goto eof
+		}
+		o.U32 = intconv.Uint32(data[start:])
+		header = data[i]
+		i++
+	}
+
+	if header == 2 {
+		start := i
+		i++
+		if i >= len(data) {
+			goto eof
+		}
+		x := uint64(data[start])
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				b := uint64(data[i])
+				i++
+				if i >= len(data) {
+					goto eof
+				}
+
+				if b < 0x80 || shift == 56 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+		o.U64 = x
+
+		header = data[i]
+		i++
+	} else if header == 2|0x80 {
+		start := i
+		i += 8
+		if i >= len(data) {
+			goto eof
+		}
+		o.U64 = intconv.Uint64(data[start:])
+		header = data[i]
+		i++
+	}
+
+	if header == 3 {
+		if i+1 >= len(data) {
+			i++
+			goto eof
+		}
+		x := uint32(data[i])
+		i++
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				b := uint32(data[i])
+				i++
+				if i >= len(data) {
+					goto eof
+				}
+
+				if b < 0x80 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+		o.I32 = int32(x)
+
+		header = data[i]
+		i++
+	} else if header == 3|0x80 {
+		if i+1 >= len(data) {
+			i++
+			goto eof
+		}
+		x := uint32(data[i])
+		i++
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				b := uint32(data[i])
+				i++
+				if i >= len(data) {
+					goto eof
+				}
+
+				if b < 0x80 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+		o.I32 = int32(^x + 1)
+
+		header = data[i]
+		i++
+	}
+
+	if header == 4 {
+		if i+1 >= len(data) {
+			i++
+			goto eof
+		}
+		x := uint64(data[i])
+		i++
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				b := uint64(data[i])
+				i++
+				if i >= len(data) {
+					goto eof
+				}
+
+				if b < 0x80 || shift == 56 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+		o.I64 = int64(x)
+
+		header = data[i]
+		i++
+	} else if header == 4|0x80 {
+		if i+1 >= len(data) {
+			i++
+			goto eof
+		}
+		x := uint64(data[i])
+		i++
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				b := uint64(data[i])
+				i++
+				if i >= len(data) {
+					goto eof
+				}
+
+				if b < 0x80 || shift == 56 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+		o.I64 = int64(^x + 1)
+
+		header = data[i]
+		i++
+	}
+
+	if header == 5 {
+		start := i
+		i += 4
+		if i >= len(data) {
+			goto eof
+		}
+		o.F32 = math.Float32frombits(intconv.Uint32(data[start:]))
+		header = data[i]
+		i++
+	}
+
+	if header == 6 {
+		start := i
+		i += 8
+		if i >= len(data) {
+			goto eof
+		}
+		o.F64 = math.Float64frombits(intconv.Uint64(data[start:]))
+		header = data[i]
+		i++
+	}
+
+	if header == 7 {
+		start := i
+		i += 8
+		if i >= len(data) {
+			goto eof
+		}
+		o.T = time.Unix(int64(intconv.Uint32(data[start:])), int64(intconv.Uint32(data[start+4:]))).In(time.UTC)
+		header = data[i]
+		i++
+	} else if header == 7|0x80 {
+		start := i
+		i += 12
+		if i >= len(data) {
+			goto eof
+		}
+		o.T = time.Unix(int64(intconv.Uint64(data[start:])), int64(intconv.Uint32(data[start+8:]))).In(time.UTC)
+		header = data[i]
+		i++
+	}
+
+	if header == 8 {
+		if i >= len(data) {
+			goto eof
+		}
+		x := uint(data[i])
+		i++
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				if i >= len(data) {
+					goto eof
+				}
+				b := uint(data[i])
+				i++
+
+				if b < 0x80 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+
+		if x > uint(ColferSizeMax) {
+			return 0, ColferMax(fmt.Sprintf("colfer: gen.o.s size %d exceeds %d bytes", x, ColferSizeMax))
+		}
+
+		start := i
+		i += int(x)
+		if i >= len(data) {
+			goto eof
+		}
+		o.S = string(data[start:i])
+
+		header = data[i]
+		i++
+	}
+
+	if header == 9 {
+		if i >= len(data) {
+			goto eof
+		}
+		x := uint(data[i])
+		i++
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				if i >= len(data) {
+					goto eof
+				}
+				b := uint(data[i])
+				i++
+
+				if b < 0x80 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+
+		if x > uint(ColferSizeMax) {
+			return 0, ColferMax(fmt.Sprintf("colfer: gen.o.a size %d exceeds %d bytes", x, ColferSizeMax))
+		}
+
+		start := i
+		i += int(x)
+		if i >= len(data) {
+			goto eof
+		}
+		// Borrow the bytes, capped to the field boundary.
+		o.A = data[start:i:i]
+
+		header = data[i]
+		i++
+	}
+
+	if header == 10 {
+
+		o.O = new(OView)
+		n, err := o.O.UnmarshalView(data[i:])
+
+		if err != nil {
+			if err == io.EOF && len(data) >= ColferSizeMax {
+				return 0, ColferMax(fmt.Sprintf("colfer: gen.o size exceeds %d bytes", ColferSizeMax))
+			}
+			return 0, err
+		}
+		i += n
+
+		if i >= len(data) {
+			goto eof
+		}
+		header = data[i]
+		i++
+	}
+
+	if header == 11 {
+		if i >= len(data) {
+			goto eof
+		}
+		x := uint(data[i])
+		i++
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				if i >= len(data) {
+					goto eof
+				}
+				b := uint(data[i])
+				i++
+
+				if b < 0x80 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+
+		if x > uint(ColferListMax) {
+			return 0, ColferMax(fmt.Sprintf("colfer: gen.o.os length %d exceeds %d elements", x, ColferListMax))
+		}
+
+		l := int(x)
+
+		a := make([]*OView, l)
+		malloc := make([]OView, l)
+
+		for ai := range a {
+			v := &malloc[ai]
+			a[ai] = v
+
+			n, err := v.UnmarshalView(data[i:])
+
+			if err != nil {
+				if err == io.EOF && len(data) >= ColferSizeMax {
+					return 0, ColferMax(fmt.Sprintf("colfer: gen.o size exceeds %d bytes", ColferSizeMax))
+				}
+				return 0, err
+			}
+			i += n
+		}
+		o.Os = a
+
+		if i >= len(data) {
+			goto eof
+		}
+		header = data[i]
+		i++
+	}
+
+	if header == 12 {
+		if i >= len(data) {
+			goto eof
+		}
+		x := uint(data[i])
+		i++
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				if i >= len(data) {
+					goto eof
+				}
+				b := uint(data[i])
+				i++
+
+				if b < 0x80 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+
+		if x > uint(ColferListMax) {
+			return 0, ColferMax(fmt.Sprintf("colfer: gen.o.ss length %d exceeds %d elements", x, ColferListMax))
+		}
+		a := make([]string, int(x))
+		o.Ss = a
+
+		for ai := range a {
+			if i >= len(data) {
+				goto eof
+			}
+			x := uint(data[i])
+			i++
+
+			if x >= 0x80 {
+				x &= 0x7f
+				for shift := uint(7); ; shift += 7 {
+					if i >= len(data) {
+						goto eof
+					}
+					b := uint(data[i])
+					i++
+
+					if b < 0x80 {
+						x |= b << shift
+						break
+					}
+					x |= (b & 0x7f) << shift
+				}
+			}
+
+			if x > uint(ColferSizeMax) {
+				return 0, ColferMax(fmt.Sprintf("colfer: gen.o.ss element %d size %d exceeds %d bytes", ai, x, ColferSizeMax))
+			}
+
+			start := i
+			i += int(x)
+			if i >= len(data) {
+				goto eof
+			}
+			a[ai] = string(data[start:i])
+		}
+
+		if i >= len(data) {
+			goto eof
+		}
+		header = data[i]
+		i++
+	}
+
+	if header == 13 {
+		if i >= len(data) {
+			goto eof
+		}
+		x := uint(data[i])
+		i++
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				if i >= len(data) {
+					goto eof
+				}
+				b := uint(data[i])
+				i++
+
+				if b < 0x80 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+
+		if x > uint(ColferListMax) {
+			return 0, ColferMax(fmt.Sprintf("colfer: gen.o.as length %d exceeds %d elements", x, ColferListMax))
+		}
+		a := make([][]byte, int(x))
+
+		for ai := range a {
+			if i >= len(data) {
+				goto eof
+			}
+			x := uint(data[i])
+			i++
+
+			if x >= 0x80 {
+				x &= 0x7f
+				for shift := uint(7); ; shift += 7 {
+					if i >= len(data) {
+						goto eof
+					}
+					b := uint(data[i])
+					i++
+
+					if b < 0x80 {
+						x |= b << shift
+						break
+					}
+					x |= (b & 0x7f) << shift
+				}
+			}
+
+			if x > uint(ColferSizeMax) {
+				return 0, ColferMax(fmt.Sprintf("colfer: gen.o.as element %d size %d exceeds %d bytes", ai, x, ColferSizeMax))
+			}
+
+			start := i
+			i += int(x)
+			if i >= len(data) {
+				goto eof
+			}
+			// Borrow the bytes, capped to the field boundary.
+			a[ai] = data[start:i:i]
+
+		}
+
+		o.As = a
+
+		if i >= len(data) {
+			goto eof
+		}
+		header = data[i]
+		i++
+	}
+
+	if header == 14 {
+		start := i
+		i++
+		if i >= len(data) {
+			goto eof
+		}
+		o.U8 = data[start]
+		header = data[i]
+		i++
+	}
+
+	if header == 15 {
+		start := i
+		i += 2
+		if i >= len(data) {
+			goto eof
+		}
+		o.U16 = intconv.Uint16(data[start:])
+		header = data[i]
+		i++
+	} else if header == 15|0x80 {
+		start := i
+		i++
+		if i >= len(data) {
+			goto eof
+		}
+		o.U16 = uint16(data[start])
+		header = data[i]
+		i++
+	}
+
+	if header == 16 {
+		if i >= len(data) {
+			goto eof
+		}
+		x := uint(data[i])
+		i++
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				if i >= len(data) {
+					goto eof
+				}
+				b := uint(data[i])
+				i++
+
+				if b < 0x80 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+
+		if x > uint(ColferListMax) {
+			return 0, ColferMax(fmt.Sprintf("colfer: gen.o.f32s length %d exceeds %d elements", x, ColferListMax))
+		}
+
+		l := int(x)
+
+		if end := i + l*4; end >= len(data) {
+			i = end
+			goto eof
+		}
+		a := make([]float32, l)
+		for ai := range a {
+			a[ai] = math.Float32frombits(intconv.Uint32(data[i:]))
+			i += 4
+		}
+		o.F32s = a
+
+		header = data[i]
+		i++
+	}
+
+	if header == 17 {
+		if i >= len(data) {
+			goto eof
+		}
+		x := uint(data[i])
+		i++
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				if i >= len(data) {
+					goto eof
+				}
+				b := uint(data[i])
+				i++
+
+				if b < 0x80 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+
+		if x > uint(ColferListMax) {
+			return 0, ColferMax(fmt.Sprintf("colfer: gen.o.f64s length %d exceeds %d elements", x, ColferListMax))
+		}
+		l := int(x)
+
+		if end := i + l*8; end >= len(data) {
+			i = end
+			goto eof
+		}
+		a := make([]float64, l)
+		for ai := range a {
+			a[ai] = math.Float64frombits(intconv.Uint64(data[i:]))
+			i += 8
+		}
+		o.F64s = a
+
+		header = data[i]
+		i++
+	}
+
+	if header != 0x7f {
+		return 0, ColferError(i - 1)
+	}
+	if i < ColferSizeMax {
+		*v = *o
+		return i, nil
+	}
+eof:
+	if i >= ColferSizeMax {
+		return 0, ColferMax(fmt.Sprintf("colfer: struct gen.o size exceeds %d bytes", ColferSizeMax))
+	}
+	return 0, io.EOF
+}
+
+// UnmarshalViewBinary decodes data as Colfer conform encoding.
+// BinaryUnmarshaler's error semantics: the input must cover one value
+// exactly. See UnmarshalView for the borrowing and lifetime rules.
+// The error return options are io.EOF, ColferError, ColferTail and ColferMax.
+func (v *OView) UnmarshalViewBinary(data []byte) error {
+	i, err := v.UnmarshalView(data)
+	if i < len(data) && err == nil {
+		return ColferTail(i)
+	}
+	return err
+}
+
+// Detach returns an independent copy of the view's value. All binary fields,
+// including the ones borrowed from the UnmarshalView input, are copied into
+// newly allocated storage. The result is not affected by later changes to the
+// source buffer, and the source may be released after Detach returns.
+func (v *OView) Detach() *O {
+	o := new(O)
+
+	o.B = v.B
+
+	o.U32 = v.U32
+
+	o.U64 = v.U64
+
+	o.I32 = v.I32
+
+	o.I64 = v.I64
+
+	o.F32 = v.F32
+
+	o.F64 = v.F64
+
+	o.T = v.T
+
+	o.S = v.S
+
+	if v.A != nil {
+		o.A = append([]byte(nil), v.A...)
+	}
+
+	if v.O != nil {
+		o.O = v.O.Detach()
+	}
+
+	if v.Os != nil {
+		a := make([]*O, len(v.Os))
+		for ai := range a {
+			if v.Os[ai] != nil {
+				a[ai] = v.Os[ai].Detach()
+			}
+		}
+		o.Os = a
+	}
+
+	if v.Ss != nil {
+		o.Ss = append(make([]string, 0, len(v.Ss)), v.Ss...)
+	}
+
+	if v.As != nil {
+		a := make([][]byte, len(v.As))
+		for ai := range a {
+			a[ai] = append([]byte(nil), v.As[ai]...)
+		}
+		o.As = a
+	}
+
+	o.U8 = v.U8
+
+	o.U16 = v.U16
+
+	if v.F32s != nil {
+		o.F32s = append(make([]float32, 0, len(v.F32s)), v.F32s...)
+	}
+
+	if v.F64s != nil {
+		o.F64s = append(make([]float64, 0, len(v.F64s)), v.F64s...)
+	}
+
+	return o
+}
+
 // DromedaryCase oposes name casings.
 type DromedaryCase struct {
 	PascalCase string `xml:"pascal-case" json:"pascal_case,omitempty"`
@@ -1381,6 +2222,114 @@ func (o *DromedaryCase) UnmarshalBinary(data []byte) error {
 	return err
 }
 
+// DromedaryCaseView is a zero-copy read view of DromedaryCase.
+//
+// Binary fields, including those nested in lists and struct fields, borrow
+// their bytes from the input passed to UnmarshalView. The input must be
+// treated as read-only and it must remain allocated and unmodified for the
+// lifetime of the view. Each borrowed slice is capped to its own field
+// boundary, so appending to one can never overwrite a neighbouring field.
+// Text fields are copied into strings, as the Go string contract requires.
+// Use Detach to release all references to the input and obtain an
+// independent, fully owned DromedaryCase.
+type DromedaryCaseView struct {
+	PascalCase string
+}
+
+// UnmarshalView decodes data as Colfer into v and returns the number of bytes
+// read. All validation, length and type checks complete before v is
+// published: on error v is left untouched and no partial view is returned.
+//
+// The returned view borrows binary bytes from data for fields of type binary.
+// Keep data alive and do not mutate it while the view, or any view derived
+// from it, is in use. The error return options are io.EOF, ColferError and
+// ColferMax.
+func (v *DromedaryCaseView) UnmarshalView(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, io.EOF
+	}
+
+	o := new(DromedaryCaseView)
+	header := data[0]
+	i := 1
+
+	if header == 0 {
+		if i >= len(data) {
+			goto eof
+		}
+		x := uint(data[i])
+		i++
+
+		if x >= 0x80 {
+			x &= 0x7f
+			for shift := uint(7); ; shift += 7 {
+				if i >= len(data) {
+					goto eof
+				}
+				b := uint(data[i])
+				i++
+
+				if b < 0x80 {
+					x |= b << shift
+					break
+				}
+				x |= (b & 0x7f) << shift
+			}
+		}
+
+		if x > uint(ColferSizeMax) {
+			return 0, ColferMax(fmt.Sprintf("colfer: gen.dromedaryCase.PascalCase size %d exceeds %d bytes", x, ColferSizeMax))
+		}
+
+		start := i
+		i += int(x)
+		if i >= len(data) {
+			goto eof
+		}
+		o.PascalCase = string(data[start:i])
+
+		header = data[i]
+		i++
+	}
+
+	if header != 0x7f {
+		return 0, ColferError(i - 1)
+	}
+	if i < ColferSizeMax {
+		*v = *o
+		return i, nil
+	}
+eof:
+	if i >= ColferSizeMax {
+		return 0, ColferMax(fmt.Sprintf("colfer: struct gen.dromedaryCase size exceeds %d bytes", ColferSizeMax))
+	}
+	return 0, io.EOF
+}
+
+// UnmarshalViewBinary decodes data as Colfer conform encoding.
+// BinaryUnmarshaler's error semantics: the input must cover one value
+// exactly. See UnmarshalView for the borrowing and lifetime rules.
+// The error return options are io.EOF, ColferError, ColferTail and ColferMax.
+func (v *DromedaryCaseView) UnmarshalViewBinary(data []byte) error {
+	i, err := v.UnmarshalView(data)
+	if i < len(data) && err == nil {
+		return ColferTail(i)
+	}
+	return err
+}
+
+// Detach returns an independent copy of the view's value. All binary fields,
+// including the ones borrowed from the UnmarshalView input, are copied into
+// newly allocated storage. The result is not affected by later changes to the
+// source buffer, and the source may be released after Detach returns.
+func (v *DromedaryCaseView) Detach() *DromedaryCase {
+	o := new(DromedaryCase)
+
+	o.PascalCase = v.PascalCase
+
+	return o
+}
+
 // EmbedO has an inner object only.
 // Covers regression of issue #66.
 type EmbedO struct {
@@ -1444,8 +2393,10 @@ func (o *EmbedO) Unmarshal(data []byte) (int, error) {
 	i := 1
 
 	if header == 0 {
+
 		o.Inner = new(O)
 		n, err := o.Inner.Unmarshal(data[i:])
+
 		if err != nil {
 			if err == io.EOF && len(data) >= ColferSizeMax {
 				return 0, ColferMax(fmt.Sprintf("colfer: gen.EmbedO size exceeds %d bytes", ColferSizeMax))
@@ -1482,4 +2433,95 @@ func (o *EmbedO) UnmarshalBinary(data []byte) error {
 		return ColferTail(i)
 	}
 	return err
+}
+
+// EmbedOView is a zero-copy read view of EmbedO.
+//
+// Binary fields, including those nested in lists and struct fields, borrow
+// their bytes from the input passed to UnmarshalView. The input must be
+// treated as read-only and it must remain allocated and unmodified for the
+// lifetime of the view. Each borrowed slice is capped to its own field
+// boundary, so appending to one can never overwrite a neighbouring field.
+// Text fields are copied into strings, as the Go string contract requires.
+// Use Detach to release all references to the input and obtain an
+// independent, fully owned EmbedO.
+type EmbedOView struct {
+	Inner *OView
+}
+
+// UnmarshalView decodes data as Colfer into v and returns the number of bytes
+// read. All validation, length and type checks complete before v is
+// published: on error v is left untouched and no partial view is returned.
+//
+// The returned view borrows binary bytes from data for fields of type binary.
+// Keep data alive and do not mutate it while the view, or any view derived
+// from it, is in use. The error return options are io.EOF, ColferError and
+// ColferMax.
+func (v *EmbedOView) UnmarshalView(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, io.EOF
+	}
+
+	o := new(EmbedOView)
+	header := data[0]
+	i := 1
+
+	if header == 0 {
+
+		o.Inner = new(OView)
+		n, err := o.Inner.UnmarshalView(data[i:])
+
+		if err != nil {
+			if err == io.EOF && len(data) >= ColferSizeMax {
+				return 0, ColferMax(fmt.Sprintf("colfer: gen.EmbedO size exceeds %d bytes", ColferSizeMax))
+			}
+			return 0, err
+		}
+		i += n
+
+		if i >= len(data) {
+			goto eof
+		}
+		header = data[i]
+		i++
+	}
+
+	if header != 0x7f {
+		return 0, ColferError(i - 1)
+	}
+	if i < ColferSizeMax {
+		*v = *o
+		return i, nil
+	}
+eof:
+	if i >= ColferSizeMax {
+		return 0, ColferMax(fmt.Sprintf("colfer: struct gen.EmbedO size exceeds %d bytes", ColferSizeMax))
+	}
+	return 0, io.EOF
+}
+
+// UnmarshalViewBinary decodes data as Colfer conform encoding.
+// BinaryUnmarshaler's error semantics: the input must cover one value
+// exactly. See UnmarshalView for the borrowing and lifetime rules.
+// The error return options are io.EOF, ColferError, ColferTail and ColferMax.
+func (v *EmbedOView) UnmarshalViewBinary(data []byte) error {
+	i, err := v.UnmarshalView(data)
+	if i < len(data) && err == nil {
+		return ColferTail(i)
+	}
+	return err
+}
+
+// Detach returns an independent copy of the view's value. All binary fields,
+// including the ones borrowed from the UnmarshalView input, are copied into
+// newly allocated storage. The result is not affected by later changes to the
+// source buffer, and the source may be released after Detach returns.
+func (v *EmbedOView) Detach() *EmbedO {
+	o := new(EmbedO)
+
+	if v.Inner != nil {
+		o.Inner = v.Inner.Detach()
+	}
+
+	return o
 }

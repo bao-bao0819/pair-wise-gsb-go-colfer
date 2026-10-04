@@ -464,6 +464,15 @@
 		if x > uint(ColferSizeMax) {
 			return 0, ColferMax(fmt.Sprintf("colfer: {{.String}} size %d exceeds %d bytes", x, ColferSizeMax))
 		}
+{{if .View}}
+		start := i
+		i += int(x)
+		if i >= len(data) {
+			goto eof
+		}
+		// Borrow the bytes, capped to the field boundary.
+		o.{{.NameNative}} = data[start:i:i]
+{{else}}
 		v := make([]byte, int(x))
 
 		start := i
@@ -473,6 +482,7 @@
 		}
 		copy(v, data[start:i])
 		o.{{.NameNative}} = v
+{{end}}
 
 		header = data[i]
 		i++
@@ -481,12 +491,23 @@
 			return 0, ColferMax(fmt.Sprintf("colfer: {{.String}} length %d exceeds %d elements", x, ColferListMax))
 		}
 		a := make([][]byte, int(x))
+{{if not .View}}
 		o.{{.NameNative}} = a
+{{end}}
 		for ai := range a {
 {{template "unmarshal-varint" .}}
 			if x > uint(ColferSizeMax) {
 				return 0, ColferMax(fmt.Sprintf("colfer: {{.String}} element %d size %d exceeds %d bytes", ai, x, ColferSizeMax))
 			}
+{{if .View}}
+			start := i
+			i += int(x)
+			if i >= len(data) {
+				goto eof
+			}
+			// Borrow the bytes, capped to the field boundary.
+			a[ai] = data[start:i:i]
+{{else}}
 			v := make([]byte, int(x))
 
 			start := i
@@ -497,8 +518,12 @@
 
 			copy(v, data[start:i])
 			a[ai] = v
+{{end}}
 		}
 
+{{if .View}}
+		o.{{.NameNative}} = a
+{{end}}
 		if i >= len(data) {
 			goto eof
 		}
@@ -514,13 +539,22 @@
 		}
 
 		l := int(x)
+{{if .View}}
+		a := make([]*{{.TypeViewNative}}, l)
+		malloc := make([]{{.TypeViewNative}}, l)
+{{else}}
 		a := make([]*{{.TypeNative}}, l)
 		malloc := make([]{{.TypeNative}}, l)
+{{end}}
 		for ai := range a {
 			v := &malloc[ai]
 			a[ai] = v
 
+{{if .View}}
+			n, err := v.UnmarshalView(data[i:])
+{{else}}
 			n, err := v.Unmarshal(data[i:])
+{{end}}
 			if err != nil {
 				if err == io.EOF && len(data) >= ColferSizeMax {
 					return 0, ColferMax(fmt.Sprintf("colfer: {{.Struct.String}} size exceeds %d bytes", ColferSizeMax))
@@ -539,8 +573,13 @@
 	}
 {{else}}
 	if header == {{.Index}} {
+{{if .View}}
+		o.{{.NameNative}} = new({{.TypeViewNative}})
+		n, err := o.{{.NameNative}}.UnmarshalView(data[i:])
+{{else}}
 		o.{{.NameNative}} = new({{.TypeNative}})
 		n, err := o.{{.NameNative}}.Unmarshal(data[i:])
+{{end}}
 		if err != nil {
 			if err == io.EOF && len(data) >= ColferSizeMax {
 				return 0, ColferMax(fmt.Sprintf("colfer: {{.Struct.String}} size exceeds %d bytes", ColferSizeMax))

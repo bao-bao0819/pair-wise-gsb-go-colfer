@@ -106,7 +106,7 @@ func (o *{{.NameNative}}) Unmarshal(data []byte) (int, error) {
 	}
 	header := data[0]
 	i := 1
-{{range .Fields}}{{template "unmarshal-field" .}}{{end}}
+{{range .Fields}}{{template "unmarshal-field" (gofield . false)}}{{end}}
 	if header != 0x7f {
 		return 0, ColferError(i - 1)
 	}
@@ -128,5 +128,105 @@ func (o *{{.NameNative}}) UnmarshalBinary(data []byte) error {
 		return ColferTail(i)
 	}
 	return err
+}
+
+// {{.NameNative}}View is a zero-copy read view of {{.NameNative}}.
+//
+// Binary fields, including those nested in lists and struct fields, borrow
+// their bytes from the input passed to UnmarshalView. The input must be
+// treated as read-only and it must remain allocated and unmodified for the
+// lifetime of the view. Each borrowed slice is capped to its own field
+// boundary, so appending to one can never overwrite a neighbouring field.
+// Text fields are copied into strings, as the Go string contract requires.
+// Use Detach to release all references to the input and obtain an
+// independent, fully owned {{.NameNative}}.
+type {{.NameNative}}View struct {
+{{range .Fields}}{{.DocText "\t// "}}
+	{{.NameNative}}	{{if .TypeList}}[]{{end}}{{if .TypeRef}}*{{end}}{{if .TypeRef}}{{.TypeViewNative}}{{else}}{{.TypeNative}}{{end}}
+{{end}}}
+
+// UnmarshalView decodes data as Colfer into v and returns the number of bytes
+// read. All validation, length and type checks complete before v is
+// published: on error v is left untouched and no partial view is returned.
+//
+// The returned view borrows binary bytes from data for fields of type binary.
+// Keep data alive and do not mutate it while the view, or any view derived
+// from it, is in use. The error return options are io.EOF, ColferError and
+// ColferMax.
+func (v *{{.NameNative}}View) UnmarshalView(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, io.EOF
+	}
+
+	o := new({{.NameNative}}View)
+	header := data[0]
+	i := 1
+{{range .Fields}}{{template "unmarshal-field" (gofield . true)}}{{end}}
+	if header != 0x7f {
+		return 0, ColferError(i - 1)
+	}
+	if i < ColferSizeMax {
+		*v = *o
+		return i, nil
+	}
+eof:
+	if i >= ColferSizeMax {
+		return 0, ColferMax(fmt.Sprintf("colfer: struct {{.String}} size exceeds %d bytes", ColferSizeMax))
+	}
+	return 0, io.EOF
+}
+
+// UnmarshalViewBinary decodes data as Colfer conform encoding.
+// BinaryUnmarshaler's error semantics: the input must cover one value
+// exactly. See UnmarshalView for the borrowing and lifetime rules.
+// The error return options are io.EOF, ColferError, ColferTail and ColferMax.
+func (v *{{.NameNative}}View) UnmarshalViewBinary(data []byte) error {
+	i, err := v.UnmarshalView(data)
+	if i < len(data) && err == nil {
+		return ColferTail(i)
+	}
+	return err
+}
+
+// Detach returns an independent copy of the view's value. All binary fields,
+// including the ones borrowed from the UnmarshalView input, are copied into
+// newly allocated storage. The result is not affected by later changes to the
+// source buffer, and the source may be released after Detach returns.
+func (v *{{.NameNative}}View) Detach() *{{.NameNative}} {
+	o := new({{.NameNative}})
+{{range .Fields}}{{if eq .Type "binary"}}{{if .TypeList}}
+	if v.{{.NameNative}} != nil {
+		a := make([][]byte, len(v.{{.NameNative}}))
+		for ai := range a {
+			a[ai] = append([]byte(nil), v.{{.NameNative}}[ai]...)
+		}
+		o.{{.NameNative}} = a
+	}
+{{else}}
+	if v.{{.NameNative}} != nil {
+		o.{{.NameNative}} = append([]byte(nil), v.{{.NameNative}}...)
+	}
+{{end}}{{else if .TypeRef}}{{if .TypeList}}
+	if v.{{.NameNative}} != nil {
+		a := make([]*{{.TypeNative}}, len(v.{{.NameNative}}))
+		for ai := range a {
+			if v.{{.NameNative}}[ai] != nil {
+				a[ai] = v.{{.NameNative}}[ai].Detach()
+			}
+		}
+		o.{{.NameNative}} = a
+	}
+{{else}}
+	if v.{{.NameNative}} != nil {
+		o.{{.NameNative}} = v.{{.NameNative}}.Detach()
+	}
+{{end}}{{else if .TypeList}}
+	if v.{{.NameNative}} != nil {
+		o.{{.NameNative}} = append(make([]{{.TypeNative}}, 0, len(v.{{.NameNative}})), v.{{.NameNative}}...)
+	}
+{{else}}
+	o.{{.NameNative}} = v.{{.NameNative}}
+{{end}}{{end}}
+	return o
 }
 {{end}}

@@ -184,6 +184,7 @@ func goMod(dir string) (modDir, modPkg string, err error) {
 // GenerateGo writes the code into file "Colfer.go".
 func GenerateGo(basedir string, packages Packages) error {
 	t := template.New("go-code")
+	template.Must(t.Funcs(template.FuncMap{"gofield": goField}).Parse(""))
 	template.Must(t.Parse(goCode))
 	template.Must(t.New("marshal-field").Parse(goMarshalField))
 	template.Must(t.New("marshal-field-len").Parse(goMarshalFieldLen))
@@ -216,6 +217,10 @@ func GenerateGo(basedir string, packages Packages) error {
 						f.TypeNative = f.TypeRef.NameNative
 						if f.TypeRef.Pkg != p {
 							f.TypeNative = f.TypeRef.Pkg.NameNative + "." + f.TypeNative
+						}
+						f.TypeViewNative = f.TypeRef.NameNative + "View"
+						if f.TypeRef.Pkg != p {
+							f.TypeViewNative = f.TypeRef.Pkg.NameNative + "." + f.TypeViewNative
 						}
 					}
 				case "timestamp":
@@ -267,6 +272,18 @@ var goUnmarshalField string
 
 //go:embed template/go-unmarshal-varint.txt
 var goUnmarshalVarint string
+
+// goFieldTpl passes field data to the unmarshal template together with a
+// flag that selects the zero-copy view variant.
+type goFieldTpl struct {
+	*Field
+	View bool
+}
+
+// goField is the template constructor for goFieldTpl.
+func goField(f *Field, view bool) *goFieldTpl {
+	return &goFieldTpl{Field: f, View: view}
+}
 
 // JavaKeywords are the reserved tokens for Java code.
 // Some entries are redundant due to the use of a Go parser.

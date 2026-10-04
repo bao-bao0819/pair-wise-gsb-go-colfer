@@ -222,6 +222,39 @@ The following table shows how Colfer data types are applied per language.
 Lists may contain floating points, text, binaries or data structures.
 
 
+## Zero-copy views (Go)
+
+Besides the owning types, Go generation also produces a read-only `<Type>View`
+for each struct. `UnmarshalView` decodes a complete value while letting every
+`binary` field, including the ones in lists and nested structs, borrow its
+bytes directly from the input buffer. This avoids copying payload data when
+only a few fields are inspected.
+
+```go
+var course CourseView
+n, err := course.UnmarshalView(data)
+if err != nil {
+	log.Fatal(err) // n/a: no partial view is ever published
+}
+// course.Image is a slice of data itself.
+fmt.Printf("%d image bytes borrowed\n", len(course.Image))
+```
+
+The input is treated as read-only and must remain alive and unmodified for
+the lifetime of the view and all views derived from it. Every borrowed slice
+is three-index sliced (`data[start:end:end]`) and capped to its own field
+boundary, so `append` can never write into a neighbouring field. Text fields
+are still copied into immutable Go strings—no `unsafe` aliasing of writable
+bytes as strings is involved. Call `Detach` to deep-copy the value into a
+fully independent, owned `<Type>` when the buffer has to be recycled.
+
+```go
+owned := course.Detach() // []byte fields are freshly allocated
+```
+
+`Marshal`/`Unmarshal` keep their original ownership promise: unmarshalled
+values own all their bytes and remain valid after the input is reused.
+
 
 ## Security
 
