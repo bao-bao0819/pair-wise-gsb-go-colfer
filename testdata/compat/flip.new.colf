@@ -1,0 +1,5 @@
+package gen
+
+type rec struct {
+	f []float64
+}

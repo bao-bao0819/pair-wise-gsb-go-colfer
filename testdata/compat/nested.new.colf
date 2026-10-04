@@ -1,0 +1,9 @@
+package gen
+
+type inner struct {
+	x uint64
+}
+
+type outer struct {
+	in inner
+}

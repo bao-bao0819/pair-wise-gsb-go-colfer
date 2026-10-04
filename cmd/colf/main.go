@@ -54,6 +54,11 @@ func main() {
 		os.Exit(2)
 	}
 
+	if strings.EqualFold(flag.Arg(0), "compat") {
+		runCompat(flag.Args()[1:])
+		return
+	}
+
 	// select language
 	var gen func(string, colfer.Packages) error
 	var tagOptions colfer.TagOptions
@@ -284,7 +289,9 @@ func printManual() {
 		"\tCompile ./io.colf with compact limits as C:\n\n" +
 		"\t\t" + name + " -b src -s 2048 -l 96 C io.colf\n\n" +
 		"\tCompile ./*.colf with a common parent as Java:\n\n" +
-		"\t\t" + name + " -p com.example.model -x com.example.io.IOBean Java\n"
+		"\t\t" + name + " -p com.example.model -x com.example.io.IOBean Java\n\n" +
+		"\tAudit whether two schema revisions can read each other's data:\n\n" +
+		"\t\t" + name + " compat -old v1/io.colf -new v2/io.colf\n"
 
 	bugsSection := bold + "BUGS" + clear + "\n" +
 		"\tReport bugs at <https://github.com/pascaldekloe/colfer/issues>.\n\n" +

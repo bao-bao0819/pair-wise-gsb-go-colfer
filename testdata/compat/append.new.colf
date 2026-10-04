@@ -1,0 +1,8 @@
+// Package gen covers a tail-append evolution for compatibility audits.
+package gen
+
+// Rec appends a field after every old field.
+type rec struct {
+	a uint32
+	b uint32
+}

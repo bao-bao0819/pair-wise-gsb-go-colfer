@@ -1,0 +1,7 @@
+// Package gen covers a tail-append evolution for compatibility audits.
+package gen
+
+// Rec is the baseline message: one field only.
+type rec struct {
+	a uint32
+}

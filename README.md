@@ -241,6 +241,24 @@ renamed to clearly discourage their use. For backwards compatibility new fields
 must be added to the end of colfer structs. Thus the number of fields can be
 seen as the schema version.
 
+The `compat` subcommand audits two revisions before code generation. It reasons
+from the wire format and the generated decoder, reports both reading
+directions ("old writer, new reader" and "new writer, old reader"), and pins
+each finding to a struct, a header index and the type change:
+
+```
+colf compat -old v1/io.colf -new v2/io.colf
+```
+
+Tail appends are only reported compatible for the direction that reads with
+the newer schema; an older decoder rejects the added header as unknown.
+Interior inserts or removes, reorders, scalar/list flips and changed nested
+types are flagged incompatible, tightened size/list limits are detected from
+the `-old-size-max`/`-new-size-max` (and list) expressions, and recursive type
+graphs keep the field path that leads to the breaking type. Anything that
+cannot be proven statically — for example a bound expression with an
+identifier — is reported as `unknown`, never assumed compatible.
+
 
 
 ## Performance
